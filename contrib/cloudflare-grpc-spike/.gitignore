@@ -1,3 +1,5 @@
-/build/
-/.wrangler/
-/target/
+build/
+.wrangler/
+target/
+node_modules/
+src/gen/
