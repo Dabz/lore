@@ -3,23 +3,24 @@
 import { Code, ConnectError } from "@connectrpc/connect";
 import { Decompress } from "fzstd";
 import { loreHash, validFragmentList, validFragmentMetadata } from "./core.js";
+import type { FragmentAddress, FragmentHeader, Scope } from "./types.js";
 
 const MAX_FRAGMENT = 256 * 1024;
 const STORED = 0x1c0000;
 const DURABLE = 0x040000;
 const UINT64_MAX = (1n << 64n) - 1n;
-export const toHex = data => Array.from(data, byte => byte.toString(16).padStart(2, "0")).join("");
-export const fromHex = value => Uint8Array.from(value.match(/../g), part => parseInt(part, 16));
+export const toHex = (data: Uint8Array) => Array.from(data, byte => byte.toString(16).padStart(2, "0")).join("");
+export const fromHex = (value: string) => Uint8Array.from(value.match(/../g)!, part => parseInt(part, 16));
 
-function invalid(message) { return new ConnectError(message, Code.InvalidArgument); }
+function invalid(message: string) { return new ConnectError(message, Code.InvalidArgument); }
 
-function contextHex(context) {
+function contextHex(context: Uint8Array) {
   if (context.length === 0) return "00".repeat(16);
   if (context.length !== 16) throw invalid("context must be 16 bytes");
   return toHex(context);
 }
 
-function addressParts(address) {
+function addressParts(address: FragmentAddress) {
   if (!address || address.hash.length !== 32) throw invalid("address hash must be 32 bytes");
   return { hash: toHex(address.hash), context: contextHex(address.context) };
 }
@@ -27,7 +28,7 @@ function addressParts(address) {
 // Bound the Zstd frame window before passing untrusted input to the decoder.
 // Accept one ordinary frame without dictionaries or checksums; reject other
 // representations instead of silently accepting a partially verified payload.
-function decodeZstd(payload, size) {
+function decodeZstd(payload: Uint8Array, size: number) {
   if (payload.length < 6 || payload[0] !== 0x28 || payload[1] !== 0xb5 || payload[2] !== 0x2f || payload[3] !== 0xfd) throw invalid("invalid Zstd frame");
   const descriptor = payload[4];
   if (descriptor & 0x1f) throw invalid("unsupported Zstd frame features");
@@ -61,7 +62,7 @@ function decodeZstd(payload, size) {
     if (pos > payload.length) throw invalid("truncated Zstd block");
   }
   if (pos !== payload.length) throw invalid("extra data after Zstd frame");
-  const chunks = [];
+  const chunks: Uint8Array[] = [];
   let total = 0;
   try {
     const decoder = new Decompress(chunk => {
@@ -81,7 +82,7 @@ function decodeZstd(payload, size) {
   return result;
 }
 
-function validateFragment(fragment, payload, expectedHash) {
+function validateFragment(fragment: FragmentHeader | undefined, payload: Uint8Array | undefined, expectedHash: string): Uint8Array {
   if (!fragment || !payload) throw invalid("fragment and payload are required");
   const { flags, sizePayload, sizeContent } = fragment;
   const compressed = flags & 0xfe;
@@ -96,14 +97,14 @@ function validateFragment(fragment, payload, expectedHash) {
   return content;
 }
 
-function objectKey(partition, hash) { return `fragments/${partition}/${hash}`; }
+function objectKey(partition: string, hash: string) { return `fragments/${partition}/${hash}`; }
 
-function fragmentFromObject(object) {
-  const flags = Number(object.customMetadata.flags);
-  const sizePayload = Number(object.customMetadata.payload);
-  const content = object.customMetadata.content;
+function fragmentFromObject(object: R2Object): FragmentHeader {
+  const flags = Number(object.customMetadata?.flags);
+  const sizePayload = Number(object.customMetadata?.payload);
+  const content = object.customMetadata?.content;
   if (!Number.isInteger(flags) || !Number.isInteger(sizePayload) || sizePayload <= 0 ||
-      sizePayload > MAX_FRAGMENT || sizePayload !== object.size || !/^\d+$/.test(content ?? "")) {
+      sizePayload > MAX_FRAGMENT || sizePayload !== object.size || content === undefined || !/^\d+$/.test(content)) {
     throw new ConnectError("invalid stored fragment metadata", Code.DataLoss);
   }
   const sizeContent = BigInt(content);
@@ -111,9 +112,10 @@ function fragmentFromObject(object) {
   return { flags: (flags & ~STORED) | DURABLE, sizePayload, sizeContent };
 }
 
-export async function putFragment(env, scope, address, fragment, payload) {
+export async function putFragment(env: Env, scope: Scope, address: FragmentAddress, fragment: FragmentHeader | undefined, payload: Uint8Array | undefined) {
   const parts = addressParts(address);
   const content = validateFragment(fragment, payload, parts.hash);
+  if (!fragment) throw invalid("fragment and payload are required");
   // Normalize compressed input to a verified plain representation. Clients can
   // read it regardless of the encoding used by the writer.
   const storedFlags = fragment.flags & ~STORED & ~0xfe;
@@ -141,20 +143,23 @@ export async function putFragment(env, scope, address, fragment, payload) {
   await scope.store.associate(parts.hash, parts.context);
 }
 
-export async function getFragment(env, scope, address, metadataOnly = false) {
+export async function getFragment(env: Env, scope: Scope, address: FragmentAddress, metadataOnly = false) {
   const parts = addressParts(address);
   if (await scope.store.matchFragment(parts.hash, parts.context) === 2) {
     throw new ConnectError("fragment not found", Code.NotFound);
   }
   const key = objectKey(scope.id, parts.hash);
-  const object = metadataOnly ? await env.FRAGMENTS.head(key) : await env.FRAGMENTS.get(key);
+  if (metadataOnly) {
+    const object = await env.FRAGMENTS.head(key);
+    if (!object) throw new ConnectError("fragment association has no payload", Code.DataLoss);
+    return { fragment: fragmentFromObject(object), payload: new Uint8Array() };
+  }
+  const object = await env.FRAGMENTS.get(key);
   if (!object) throw new ConnectError("fragment association has no payload", Code.DataLoss);
-  const fragment = fragmentFromObject(object);
-  const payload = metadataOnly ? new Uint8Array() : new Uint8Array(await object.arrayBuffer());
-  return { fragment, payload };
+  return { fragment: fragmentFromObject(object), payload: new Uint8Array(await object.arrayBuffer()) };
 }
 
-export async function queryFragments(scope, addresses) {
+export async function queryFragments(scope: Scope, addresses: FragmentAddress[]) {
   if (addresses.length > Math.floor(MAX_FRAGMENT / 48)) throw invalid("too many addresses");
   const results = [];
   for (const address of addresses) {
@@ -164,7 +169,7 @@ export async function queryFragments(scope, addresses) {
   return { results };
 }
 
-export function itemStatus(error) {
+export function itemStatus(error: unknown) {
   if (error instanceof ConnectError) return { code: error.code, message: error.rawMessage };
   console.error(JSON.stringify({ message: "fragment operation failed", error: String(error) }));
   return { code: Code.Internal, message: "fragment operation failed" };

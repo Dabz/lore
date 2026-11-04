@@ -1,37 +1,41 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 import { DurableObject } from "cloudflare:workers";
-import { Code, ConnectError } from "@connectrpc/connect";
+import { Code, ConnectError, type ServiceImpl } from "@connectrpc/connect";
+import type { RepositoryService } from "./gen/lore/repository/v1/repository_pb.js";
 import { fromHex, putFragment, toHex } from "./immutable.js";
 import { branchMetadata, repositoryMetadata } from "./metadata.js";
 import { loreHash } from "./core.js";
+import type { BranchData, RepositoryData, RepositoryRequest, Scope } from "./types.js";
 
 const encoder = new TextEncoder();
 const ZERO_CONTEXT = new Uint8Array(16);
-const byteLength = value => encoder.encode(value).length;
+const byteLength = (value: string) => encoder.encode(value).length;
 
-function id(value, label) {
+function id(value: Uint8Array, label: string) {
   if (value.length !== 16 || value.every(byte => byte === 0)) throw new ConnectError(`invalid ${label}`, Code.InvalidArgument);
   return toHex(value);
 }
-function repositoryRecord(record) {
+function repositoryRecord(record: RepositoryData) {
   return { ...record, id: fromHex(record.id), defaultBranchId: fromHex(record.defaultBranchId), metadata: fromHex(record.metadata), created: BigInt(record.created) };
 }
-export function branchRecord(record) {
+export function branchRecord(record: BranchData) {
   return { ...record, id: fromHex(record.id), latest: fromHex(record.latest), metadata: fromHex(record.metadata), created: BigInt(record.created), stack: [] };
 }
 
 // Names are a global coordination atom. Entries remain reserved through a crash
 // until the same request retries, and become visible only after initialization.
-export class RepositoryCatalog extends DurableObject {
-  constructor(ctx, env) {
+type RepositoryRow = { request: string; created: number; metadata: string | null };
+
+export class RepositoryCatalog extends DurableObject<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS repositories (id TEXT PRIMARY KEY, name TEXT UNIQUE NOT NULL, request TEXT NOT NULL, created INTEGER NOT NULL, metadata TEXT)");
   }
-  reserve(request) {
+  reserve(request: RepositoryRequest): { conflict: true } | { created: number; metadata: string | null } {
     return this.ctx.storage.transactionSync(() => {
       const sql = this.ctx.storage.sql;
-      const prior = sql.exec("SELECT * FROM repositories WHERE id = ? OR name = ?", request.id, request.name).toArray();
+      const prior = sql.exec<RepositoryRow>("SELECT * FROM repositories WHERE id = ? OR name = ?", request.id, request.name).toArray();
       if (prior.length) {
         if (prior.length !== 1 || prior[0].request !== JSON.stringify(request)) return { conflict: true };
         return { created: prior[0].created, metadata: prior[0].metadata };
@@ -41,28 +45,29 @@ export class RepositoryCatalog extends DurableObject {
       return { created, metadata: null };
     });
   }
-  finish(id, metadata) {
+  finish(id: string, metadata: string) {
     this.ctx.storage.sql.exec("UPDATE repositories SET metadata = COALESCE(metadata, ?) WHERE id = ?", metadata, id);
   }
-  get(kind, value) {
-    const row = this.ctx.storage.sql.exec(`SELECT * FROM repositories WHERE ${kind === "id" ? "id" : "name"} = ? AND metadata IS NOT NULL`, value).toArray()[0];
-    return row ? { ...JSON.parse(row.request), created: row.created, metadata: row.metadata } : null;
+  get(kind: "id" | "name", value: string): RepositoryData | null {
+    const row = this.ctx.storage.sql.exec<RepositoryRow>(`SELECT * FROM repositories WHERE ${kind === "id" ? "id" : "name"} = ? AND metadata IS NOT NULL`, value).toArray()[0];
+    return row && row.metadata !== null ? { ...JSON.parse(row.request) as RepositoryRequest, created: row.created, metadata: row.metadata } : null;
   }
-  list(creator) {
-    return this.ctx.storage.sql.exec("SELECT * FROM repositories WHERE metadata IS NOT NULL ORDER BY name").toArray()
-      .map(row => ({ ...JSON.parse(row.request), created: row.created, metadata: row.metadata }))
+  list(creator: string | null): RepositoryData[] {
+    return this.ctx.storage.sql.exec<RepositoryRow>("SELECT * FROM repositories WHERE metadata IS NOT NULL ORDER BY name").toArray()
+      .filter((row): row is RepositoryRow & { metadata: string } => row.metadata !== null)
+      .map(row => ({ ...JSON.parse(row.request) as RepositoryRequest, created: row.created, metadata: row.metadata }))
       .filter(record => creator === null || record.creator === creator);
   }
 }
 
-function catalog(env) { return env.CATALOG.getByName("repositories"); }
-async function writeMetadata(env, scope, payload) {
+function catalog(env: Env) { return env.CATALOG.getByName("repositories"); }
+async function writeMetadata(env: Env, scope: Scope, payload: Uint8Array) {
   const address = { hash: loreHash(payload), context: ZERO_CONTEXT };
   await putFragment(env, scope, address, { flags: 0, sizePayload: payload.length, sizeContent: BigInt(payload.length) }, payload);
   return toHex(address.hash);
 }
 
-export function repositoryService(env) {
+export function repositoryService(env: Env): Partial<ServiceImpl<typeof RepositoryService>> {
   return {
     async repositoryCreate(req) {
       const repoId = id(req.id, "repository id");
@@ -73,7 +78,7 @@ export function repositoryService(env) {
       }
       const request = { id: repoId, name: req.name, description: req.description, defaultBranchId: branchId, defaultBranchName: req.defaultBranchName, creator: req.creator ?? "" };
       const reservation = await catalog(env).reserve(request);
-      if (reservation.conflict) throw new ConnectError("repository id or name already exists", Code.AlreadyExists);
+      if ("conflict" in reservation) throw new ConnectError("repository id or name already exists", Code.AlreadyExists);
       const record = { ...request, created: reservation.created };
       const scope = { id: repoId, store: env.MUTABLE.getByName(repoId) };
       const metadata = await writeMetadata(env, scope, repositoryMetadata(record, req.defaultBranchId));

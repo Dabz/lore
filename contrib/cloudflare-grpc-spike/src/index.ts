@@ -11,18 +11,19 @@ import { RevisionService } from "./gen/lore/revision/v1/revision_pb.js";
 import { fromHex, getFragment, itemStatus, putFragment, queryFragments, toHex } from "./immutable.js";
 import { branchRecord, repositoryService } from "./repository.js";
 import { verifyRevision } from "./revision.js";
+import type { BranchData, RepositoryRequest, Scope } from "./types.js";
 export { RepositoryCatalog } from "./repository.js";
 
 const ZERO = "00".repeat(32);
-const hex = bytes => Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
-const bytes = value => Uint8Array.from(value.match(/../g), part => parseInt(part, 16));
+const hex = (bytes: Uint8Array) => Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+const bytes = (value: string) => Uint8Array.from(value.match(/../g)!, part => parseInt(part, 16));
 
-function hash(value, label) {
+function hash(value: Uint8Array, label: string) {
   if (value.length !== 32) throw new ConnectError(`${label} must be 32 bytes`, Code.InvalidArgument);
   return hex(value);
 }
 
-function keyType(value, write = false) {
+function keyType(value: number, write = false) {
   if (value > 7) throw new ConnectError("invalid key type", Code.InvalidArgument);
   // These types have dedicated, validated mutation APIs in the Lore server.
   if (write && (value === 1 || value === 3 || value === 4)) {
@@ -31,7 +32,7 @@ function keyType(value, write = false) {
   return value;
 }
 
-function partition(headers, env) {
+function partition(headers: Headers, env: Env): Scope {
   const encoded = headers.get("lore-partition-bin") ?? headers.get("urc-repository-id-bin");
   if (!encoded) throw new ConnectError("missing repository ID", Code.InvalidArgument);
   let id;
@@ -47,19 +48,19 @@ function partition(headers, env) {
 
 // One instance per partition. Synchronous SQLite transactions make each CAS atomic,
 // including the read of a missing key and a concurrent insert.
-export class MutablePartition extends DurableObject {
-  constructor(ctx, env) {
+export class MutablePartition extends DurableObject<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS entries (type INTEGER NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (type, key))");
     this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS fragments (hash TEXT NOT NULL, context TEXT NOT NULL, PRIMARY KEY (hash, context))");
     this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS branches (id TEXT PRIMARY KEY, name TEXT COLLATE NOCASE UNIQUE NOT NULL, record TEXT NOT NULL)");
   }
 
-  load(type, key) {
-    return this.ctx.storage.sql.exec("SELECT value FROM entries WHERE type = ? AND key = ?", type, key).toArray()[0]?.value ?? null;
+  load(type: number, key: string) {
+    return this.ctx.storage.sql.exec<{ value: string }>("SELECT value FROM entries WHERE type = ? AND key = ?", type, key).toArray()[0]?.value ?? null;
   }
 
-  store(type, key, value) {
+  store(type: number, key: string, value: string) {
     if (value === ZERO) {
       this.ctx.storage.sql.exec("DELETE FROM entries WHERE type = ? AND key = ?", type, key);
     } else {
@@ -67,7 +68,7 @@ export class MutablePartition extends DurableObject {
     }
   }
 
-  compareAndSwap(type, key, expected, value) {
+  compareAndSwap(type: number, key: string, expected: string, value: string) {
     return this.ctx.storage.transactionSync(() => {
       const current = this.load(type, key) ?? ZERO;
       // Unlike store(zero), CAS can install an explicit zero value. Lore uses
@@ -79,24 +80,24 @@ export class MutablePartition extends DurableObject {
     });
   }
 
-  associate(hash, context) {
+  associate(hash: string, context: string) {
     this.ctx.storage.sql.exec("INSERT OR IGNORE INTO fragments (hash, context) VALUES (?, ?)", hash, context);
   }
 
-  matchFragment(hash, context) {
+  matchFragment(hash: string, context: string) {
     const matches = this.ctx.storage.sql.exec("SELECT context FROM fragments WHERE hash = ? ORDER BY context = ? DESC LIMIT 1", hash, context).toArray();
     return matches.length === 0 ? 2 : matches[0].context === context ? 0 : 1;
   }
 
-  initializeRepository(request, created, metadata, branchHash) {
+  initializeRepository(request: RepositoryRequest, created: number, metadata: string, branchHash: string) {
     this.ctx.storage.transactionSync(() => {
-      const existing = this.ctx.storage.sql.exec("SELECT record FROM branches WHERE id = ?", request.defaultBranchId).toArray()[0];
-      const record = {
+      const existing = this.ctx.storage.sql.exec<{ record: string }>("SELECT record FROM branches WHERE id = ?", request.defaultBranchId).toArray()[0];
+      const record: BranchData = {
         id: request.defaultBranchId, name: request.defaultBranchName, creator: request.creator,
         category: "", created, latest: ZERO, deleted: false, metadata: branchHash,
       };
       if (existing) {
-        const prior = JSON.parse(existing.record);
+        const prior = JSON.parse(existing.record) as BranchData;
         if (prior.id !== record.id || prior.name !== record.name || prior.creator !== record.creator || prior.created !== record.created || prior.metadata !== record.metadata) {
           throw new Error("repository initialization conflict");
         }
@@ -105,21 +106,21 @@ export class MutablePartition extends DurableObject {
     });
   }
 
-  getBranch(kind, value) {
-    const row = this.ctx.storage.sql.exec(`SELECT record FROM branches WHERE ${kind === "id" ? "id" : "name"} = ?`, value).toArray()[0];
-    return row ? JSON.parse(row.record) : null;
+  getBranch(kind: "id" | "name", value: string): BranchData | null {
+    const row = this.ctx.storage.sql.exec<{ record: string }>(`SELECT record FROM branches WHERE ${kind === "id" ? "id" : "name"} = ?`, value).toArray()[0];
+    return row ? JSON.parse(row.record) as BranchData : null;
   }
 
-  listBranches(creator) {
-    return this.ctx.storage.sql.exec("SELECT record FROM branches ORDER BY name").toArray()
-      .map(row => JSON.parse(row.record)).filter(record => creator === null || record.creator === creator);
+  listBranches(creator: string | null): BranchData[] {
+    return this.ctx.storage.sql.exec<{ record: string }>("SELECT record FROM branches ORDER BY name").toArray()
+      .map(row => JSON.parse(row.record) as BranchData).filter(record => creator === null || record.creator === creator);
   }
 
-  advanceBranch(id, expected, next, number) {
+  advanceBranch(id: string, expected: string, next: string, number: string): { result: "missing" } | { result: "ok" } | { result: "diverged"; latest: string } {
     return this.ctx.storage.transactionSync(() => {
-      const row = this.ctx.storage.sql.exec("SELECT record FROM branches WHERE id = ?", id).toArray()[0];
+      const row = this.ctx.storage.sql.exec<{ record: string }>("SELECT record FROM branches WHERE id = ?", id).toArray()[0];
       if (!row) return { result: "missing" };
-      const record = JSON.parse(row.record);
+      const record = JSON.parse(row.record) as BranchData;
       if (record.latest === next) return { result: "ok" };
       if (record.latest !== expected || BigInt(record.number ?? "0") + 1n !== BigInt(number)) return { result: "diverged", latest: record.latest };
       record.latest = next;
@@ -131,18 +132,15 @@ export class MutablePartition extends DurableObject {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request: Request, env: Env) {
     const router = createConnectRouter();
     router.service(EnvironmentService, { environmentGet: () => ({ environment: { config: { compressionMode: 1, maxQueryBatch: 5461 } } }) });
     router.service(RepositoryService, repositoryService(env));
     router.service(RevisionService, {
       async branchGet(req, context) {
         if (!req.query?.case) throw new ConnectError("branch query required", Code.InvalidArgument);
-        let value = req.query.value;
-        if (req.query.case === "id") {
-          if (value.length !== 16) throw new ConnectError("invalid branch id", Code.InvalidArgument);
-          value = hex(value);
-        }
+        if (req.query.case === "id" && req.query.value.length !== 16) throw new ConnectError("invalid branch id", Code.InvalidArgument);
+        const value = req.query.case === "id" ? hex(req.query.value) : req.query.value;
         const record = await partition(context.requestHeader, env).store.getBranch(req.query.case, value);
         if (!record) throw new ConnectError("branch not found", Code.NotFound);
         return { branch: branchRecord(record) };
@@ -279,4 +277,4 @@ export default {
     if (!handler) return new Response("Not found", { status: 404 });
     return universalServerResponseToFetch(await handler(universalServerRequestFromFetch(request, {})));
   },
-};
+} satisfies ExportedHandler<Env>;

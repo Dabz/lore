@@ -25,7 +25,7 @@ const b = new Uint8Array(32).fill(2);
 let worker;
 
 async function start() {
-  worker = spawn("wrangler", ["dev", "--local", "--config", "wrangler.jsonc", "--persist-to", state, "--ip", "127.0.0.1", "--port", "8798"], { stdio: "inherit" });
+  worker = spawn(process.execPath, ["./node_modules/wrangler/bin/wrangler.js", "dev", "--local", "--config", "wrangler.jsonc", "--persist-to", state, "--ip", "127.0.0.1", "--port", "8798"], { stdio: "inherit" });
   for (let i = 0; i < 150; i++) {
     if (worker.exitCode !== null) throw new Error(`Wrangler exited ${worker.exitCode}`);
     try { await fetch(origin); return; } catch { await delay(100); }

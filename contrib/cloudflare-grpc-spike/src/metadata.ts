@@ -1,19 +1,20 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 import { encodeMetadata } from "./core.js";
+import type { RepositoryRequest } from "./types.js";
 const utf8 = new TextEncoder();
-const string = value => utf8.encode(value);
-const number = value => {
+const string = (value: string) => utf8.encode(value);
+const number = (value: number) => {
   const result = new Uint8Array(8);
   new DataView(result.buffer).setBigUint64(0, BigInt(value), true);
   return result;
 };
 
-function encode(entries) {
+function encode(entries: Array<[string, number, Uint8Array]>) {
   return encodeMetadata(entries.map(([key, type, value]) => [string(key), type, value]));
 }
 
-export function repositoryMetadata(record, branchId) {
+export function repositoryMetadata(record: RepositoryRequest & { created: number }, branchId: Uint8Array) {
   return encode([
     ["name", 6, string(record.name)], ["description", 6, string(record.description)],
     ["default-branch", 3, branchId], ["default-branch-name", 6, string(record.defaultBranchName)],
@@ -21,7 +22,7 @@ export function repositoryMetadata(record, branchId) {
   ]);
 }
 
-export function branchMetadata(record, branchId) {
+export function branchMetadata(record: RepositoryRequest & { created: number }, branchId: Uint8Array) {
   return encode([
     ["id", 255, branchId], ["name", 6, string(record.defaultBranchName)],
     ["category", 6, string("")], ["creator", 6, string(record.creator)],

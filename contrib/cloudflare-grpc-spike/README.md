@@ -37,10 +37,37 @@ The example token only satisfies the CLI's local identity handling. The Worker
 does not validate it or enforce permissions. The exact installed client version
 and its TLS environment may behave differently.
 
+## Architecture
+
+```mermaid
+flowchart LR
+    CLI["Lore CLI"] -->|"native gRPC / TLS"| Edge["Cloudflare edge<br/>gRPC to gRPC-web"]
+    subgraph CF["Cloudflare Workers platform"]
+        Edge --> Worker
+        subgraph Worker["Lore Worker"]
+            Connect["TypeScript<br/>Connect / gRPC-web adapter"]
+            Adapters["TypeScript<br/>repository, storage & revision adapters"]
+            Core["Rust Lore core<br/>compiled to WebAssembly"]
+            Connect --> Adapters
+            Adapters -->|"synchronous ABI"| Core
+        end
+        Adapters -->|"repository names and initialization"| Catalog["RepositoryCatalog<br/>Durable Object + SQLite"]
+        Adapters -->|"per-repository mutable keys,<br/>branches and fragment associations"| Partition["MutablePartition<br/>Durable Object + SQLite"]
+        Adapters -->|"content-addressed fragment payloads"| R2["R2 bucket"]
+    end
+```
+
+The Worker routes API calls through Connect. SQLite transactions coordinate
+repository names, mutable keys, and branch-tip updates; R2 stores fragment
+payloads. The adapters call the shared Rust core in Wasm for fragment checks,
+hashing, and metadata encoding and validation. Revision traversal and branch
+operations are currently implemented in TypeScript. The loopback bridge used
+by the probes is a test harness and is not part of the deployed architecture.
+
 ## Reproduce the probes
 
 From `contrib/cloudflare-grpc-spike/`, install Node with Zstd support, npm,
-Wrangler 4, `protoc`, and Rust with the `wasm32-unknown-unknown` target. For the
+`protoc`, and Rust with the `wasm32-unknown-unknown` target. For the
 CLI probe, build `target/debug/lore` with `cargo build --locked -p lore-client
 --bin lore` at the workspace root. Protobuf generation uses this checkout's
 `lore-proto` definitions; Wrangler compiles the portable Rust core automatically:
@@ -48,6 +75,7 @@ CLI probe, build `target/debug/lore` with `cargo build --locked -p lore-client
 ```sh
 npm ci
 npm run generate
+npm run typecheck
 node mutable-probe.mjs
 node core-probe.mjs
 node immutable-probe.mjs
@@ -55,8 +83,12 @@ node cli-probe.mjs
 node cli-probe.mjs https://lore-mvp.gasparina.work
 ```
 
+`npm run generate` creates protobuf JavaScript and TypeScript declarations;
+`npm run typecheck` regenerates Cloudflare runtime and binding types from the
+local Wrangler configuration, builds the Wasm core, and checks the Worker.
+Re-run both commands after changing the relevant protobuf or Wrangler config.
 To run the Worker locally after generating the protobuf files, use
-`wrangler dev --local` from this directory.
+`npx wrangler dev --local` from this directory.
 
 Run local probes sequentially because Wrangler may choose the same internal
 ports. They use temporary local state and remove it on exit. The remote probe
@@ -72,7 +104,7 @@ compiler (for example, `export RUSTC="$(rustup which rustc)"`).
 Fragment ingress checks, content hashing and metadata buffer encoding and
 validation use the same portable Rust code as native Lore through Wasm. The
 Fetch/Connect, R2 and Durable Object adapters, Zstd decoding, revision graph
-traversal and branch operations remain JavaScript; this is not a complete
+traversal and branch operations are TypeScript; this is not a complete
 port of the Lore server or its revision semantics.
 
 Implemented: discovery; repository create/get/list and metadata get; default
@@ -99,4 +131,4 @@ implemented.
 
 `wrangler.jsonc` is local-only. `wrangler.remote.jsonc` configures the isolated
 remote deployment; from this directory, deploy with `CLOUDFLARE_ACCOUNT_ID`
-set to the intended account and `wrangler deploy --config wrangler.remote.jsonc`.
+set to the intended account and `npx wrangler deploy --config wrangler.remote.jsonc`.

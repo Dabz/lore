@@ -17,7 +17,7 @@ if (target && (target.protocol !== "https:" || target.pathname !== "/" || target
 const temp = await mkdtemp(join(tmpdir(), "lore-cli-worker-"));
 const work = join(temp, "work");
 await mkdir(work);
-const worker = target ? null : spawn("wrangler", ["dev", "--local", "--config", "wrangler.jsonc", "--persist-to", join(temp, "state"), "--ip", "127.0.0.1", "--port", "8796"], { stdio: "inherit" });
+const worker = target ? null : spawn(process.execPath, ["./node_modules/wrangler/bin/wrangler.js", "dev", "--local", "--config", "wrangler.jsonc", "--persist-to", join(temp, "state"), "--ip", "127.0.0.1", "--port", "8796"], { stdio: "inherit" });
 const bridge = http2.createServer();
 const remote = target ? http2.connect(target.origin) : null;
 if (remote) remote.on("error", error => console.error(`upstream: ${error.message}`));

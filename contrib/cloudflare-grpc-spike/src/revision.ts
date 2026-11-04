@@ -3,18 +3,19 @@
 import { Code, ConnectError } from "@connectrpc/connect";
 import { getFragment, toHex } from "./immutable.js";
 import { validMetadata } from "./core.js";
+import type { Scope } from "./types.js";
 
 const zeroContext = new Uint8Array(16);
-const view = data => new DataView(data.buffer, data.byteOffset, data.byteLength);
-const hashAt = (data, offset) => data.slice(offset, offset + 32);
-const isZero = data => data.every(byte => byte === 0);
-const invalid = message => new ConnectError(message, Code.FailedPrecondition);
+const view = (data: Uint8Array) => new DataView(data.buffer, data.byteOffset, data.byteLength);
+const hashAt = (data: Uint8Array, offset: number) => data.slice(offset, offset + 32);
+const isZero = (data: Uint8Array) => data.every(byte => byte === 0);
+const invalid = (message: string) => new ConnectError(message, Code.FailedPrecondition);
 
 // This intentionally accepts only the simple current-format, unfragmented tree
 // subset. Anything not traversed and verified is rejected before moving a tip.
-export async function verifyRevision(env, scope, signature) {
+export async function verifyRevision(env: Env, scope: Scope, signature: Uint8Array) {
   let reads = 0;
-  async function read(hash, context = zeroContext) {
+  async function read(hash: Uint8Array, context: Uint8Array = zeroContext) {
     if (isZero(hash)) return null;
     if (++reads > 4096) throw new ConnectError("revision exceeds MVP verification limit", Code.ResourceExhausted);
     let item;
@@ -26,7 +27,7 @@ export async function verifyRevision(env, scope, signature) {
     if ((item.fragment.flags & 1) !== 0) throw new ConnectError("fragmented revisions are not supported yet", Code.Unimplemented);
     return item.payload;
   }
-  async function metadata(hash) {
+  async function metadata(hash: Uint8Array) {
     const data = await read(hash);
     if (!data) return;
     if (!data.length || !validMetadata(data)) throw invalid("invalid metadata");
