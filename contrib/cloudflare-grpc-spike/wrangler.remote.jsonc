@@ -5,15 +5,27 @@
   "compatibility_date": "2026-10-08",
   "build": { "command": "cargo build --locked --release --target wasm32-unknown-unknown --manifest-path core/Cargo.toml" },
   "workers_dev": false,
+  "vars": {
+    "PACK_MAX_BYTES": "104857600",
+    "PACK_LINGER_MS": "1000",
+    "PACK_CONCURRENCY": "50",
+    "PACK_MAX_PENDING": "1000"
+  },
   "routes": [{ "pattern": "lore-mvp.gasparina.work", "custom_domain": true }],
-  "r2_buckets": [{ "binding": "FRAGMENTS", "bucket_name": "lore-worker-mvp-spike-20261104" }],
+  "r2_buckets": [{ "binding": "FRAGMENTS", "bucket_name": "lore-worker-mvp-packs-20261104" }],
   "durable_objects": {
     "bindings": [
-      { "name": "MUTABLE", "class_name": "MutablePartition" },
-      { "name": "CATALOG", "class_name": "RepositoryCatalog" }
+      { "name": "MUTABLE", "class_name": "PackedMutablePartition" },
+      { "name": "CATALOG", "class_name": "PackedRepositoryCatalog" }
     ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MutablePartition", "RepositoryCatalog"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["MutablePartition", "RepositoryCatalog"] },
+    { "tag": "v2", "new_sqlite_classes": ["PackedMutablePartition", "PackedRepositoryCatalog"] }
+  ],
+  // Paid Workers can raise the per-invocation subrequest budget. Long-lived
+  // gRPC streams still depend on the domain's request-body limit.
+  "limits": { "subrequests": 50000 },
   "observability": { "enabled": true },
   "upload_source_maps": true
 }

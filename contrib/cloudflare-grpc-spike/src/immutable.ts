@@ -3,12 +3,12 @@
 import { Code, ConnectError } from "@connectrpc/connect";
 import { Decompress } from "fzstd";
 import { loreHash, validFragmentList, validFragmentMetadata } from "./core.js";
-import type { FragmentAddress, FragmentHeader, Scope } from "./types.js";
+import type { FragmentAddress, FragmentHeader, PackEntry, PackLocation, Scope } from "./types.js";
+import type { PackOptions } from "./pack-options.js";
 
 const MAX_FRAGMENT = 256 * 1024;
 const STORED = 0x1c0000;
 const DURABLE = 0x040000;
-const UINT64_MAX = (1n << 64n) - 1n;
 export const toHex = (data: Uint8Array) => Array.from(data, byte => byte.toString(16).padStart(2, "0")).join("");
 export const fromHex = (value: string) => Uint8Array.from(value.match(/../g)!, part => parseInt(part, 16));
 
@@ -97,76 +97,136 @@ function validateFragment(fragment: FragmentHeader | undefined, payload: Uint8Ar
   return content;
 }
 
-function objectKey(partition: string, hash: string) { return `fragments/${partition}/${hash}`; }
-
-function fragmentFromObject(object: R2Object): FragmentHeader {
-  const flags = Number(object.customMetadata?.flags);
-  const sizePayload = Number(object.customMetadata?.payload);
-  const content = object.customMetadata?.content;
-  if (!Number.isInteger(flags) || !Number.isInteger(sizePayload) || sizePayload <= 0 ||
-      sizePayload > MAX_FRAGMENT || sizePayload !== object.size || content === undefined || !/^\d+$/.test(content)) {
-    throw new ConnectError("invalid stored fragment metadata", Code.DataLoss);
-  }
-  const sizeContent = BigInt(content);
-  if (sizeContent > UINT64_MAX) throw new ConnectError("invalid stored content size", Code.DataLoss);
-  return { flags: (flags & ~STORED) | DURABLE, sizePayload, sizeContent };
-}
-
-export async function putFragment(env: Env, scope: Scope, address: FragmentAddress, fragment: FragmentHeader | undefined, payload: Uint8Array | undefined) {
+type Prepared = { hash: string; context: string; flags: number; content: string; payload: Uint8Array };
+function prepare(address: FragmentAddress, fragment: FragmentHeader | undefined, payload: Uint8Array | undefined): Prepared {
   const parts = addressParts(address);
   const content = validateFragment(fragment, payload, parts.hash);
   if (!fragment) throw invalid("fragment and payload are required");
-  // Normalize compressed input to a verified plain representation. Clients can
-  // read it regardless of the encoding used by the writer.
-  const storedFlags = fragment.flags & ~STORED & ~0xfe;
-  const key = objectKey(scope.id, parts.hash);
-  // R2 stores the complete representation atomically before its association is
-  // published. A crash can leave an unreferenced object, never a dangling row.
-  const created = await env.FRAGMENTS.put(key, content, {
-    onlyIf: new Headers({ "if-none-match": "*" }),
-    customMetadata: {
-      flags: String(storedFlags),
-      payload: String(content.length),
-      content: String(fragment.sizeContent),
-    },
-  });
-  if (!created) {
-    const existing = await env.FRAGMENTS.head(key);
-    if (!existing) throw new ConnectError("fragment disappeared during put", Code.Unavailable);
-    const stored = fragmentFromObject(existing);
-    // A plain payload and a fragment list can have identical bytes but different
-    // interpretations. Never claim that the conflicting representation was stored.
-    if ((stored.flags & 1) !== (fragment.flags & 1) || stored.sizeContent !== fragment.sizeContent) {
-      throw new ConnectError("fragment conflicts with existing representation", Code.AlreadyExists);
+  return { ...parts, flags: fragment.flags & ~STORED & ~0xfe, content: String(fragment.sizeContent), payload: content };
+}
+
+async function writePack(env: Env, scope: Scope, items: Prepared[]) {
+  const key = `packs/${scope.id}/${crypto.randomUUID()}`;
+  const buffer = new Uint8Array(items.reduce((size, item) => size + item.payload.length, 0));
+  const entries: PackEntry[] = [];
+  let offset = 0;
+  for (const item of items) {
+    buffer.set(item.payload, offset);
+    entries.push({ hash: item.hash, context: item.context, key, offset, length: item.payload.length, flags: item.flags, content: item.content });
+    offset += item.payload.length;
+  }
+  // A successful R2 put precedes the atomic index and association transaction.
+  // Interrupted or conflicting writes may leave unreachable pack bytes.
+  await env.FRAGMENTS.put(key, buffer);
+  return scope.store.publishPack(entries);
+}
+
+export async function putFragment(env: Env, scope: Scope, address: FragmentAddress, fragment: FragmentHeader | undefined, payload: Uint8Array | undefined) {
+  const [ok] = await writePack(env, scope, [prepare(address, fragment, payload)]);
+  if (!ok) throw new ConnectError("fragment conflicts with existing representation", Code.AlreadyExists);
+}
+
+type Pending = { item: Prepared; resolve: () => void; reject: (error: unknown) => void };
+// Count the original fragment bytes as well as the pack's concatenated copy:
+// at most 32 MiB of validated payloads plus their R2 buffers per stream.
+const BUFFER_BUDGET = 32 * 1024 * 1024;
+export class PackWriter {
+  private pending: Pending[] = [];
+  private queued: Pending[][] = [];
+  private size = 0;
+  private active = 0;
+  private buffered = 0;
+  private capacityWaiters = new Set<() => void>();
+  private timer: ReturnType<typeof setTimeout> | undefined;
+  private closed = false;
+  private batchTarget: number;
+  constructor(private env: Env, private scope: Scope, private options: PackOptions) {
+    // Reserve room for several uploads rather than allowing one large pack to
+    // consume the entire budget. The configured max remains a hard upper bound.
+    this.batchTarget = Math.min(options.maxBytes, Math.floor(BUFFER_BUDGET / Math.min(options.concurrency, 4)));
+  }
+  async waitForCapacity() {
+    while (!this.closed && this.buffered >= BUFFER_BUDGET) {
+      this.flush();
+      await new Promise<void>(resolve => this.capacityWaiters.add(resolve));
     }
   }
-  await scope.store.associate(parts.hash, parts.context);
+  private signalCapacity() {
+    for (const resolve of this.capacityWaiters) resolve();
+    this.capacityWaiters.clear();
+  }
+  add(address: FragmentAddress, fragment: FragmentHeader | undefined, payload: Uint8Array | undefined): Promise<void> {
+    if (this.closed) throw new ConnectError("stream closed", Code.Canceled);
+    const item = prepare(address, fragment, payload);
+    if (this.size + item.payload.length > this.batchTarget) this.flush();
+    const result = new Promise<void>((resolve, reject) => this.pending.push({ item, resolve, reject }));
+    this.size += item.payload.length;
+    this.buffered += item.payload.length;
+    if (this.size >= this.batchTarget) this.flush();
+    else if (!this.timer) this.timer = setTimeout(() => this.flush(), this.options.lingerMs);
+    return result;
+  }
+  flush() {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+    if (!this.pending.length) return;
+    this.queued.push(this.pending);
+    this.pending = [];
+    this.size = 0;
+    this.start();
+  }
+  private start() {
+    while (!this.closed && this.active < this.options.concurrency && this.queued.length) {
+      const batch = this.queued.shift()!;
+      this.active++;
+      void writePack(this.env, this.scope, batch.map(entry => entry.item)).then(results => {
+        batch.forEach((entry, i) => results[i] ? entry.resolve() : entry.reject(new ConnectError("fragment conflicts with existing representation", Code.AlreadyExists)));
+      }, error => batch.forEach(entry => entry.reject(error))).finally(() => {
+        this.buffered -= batch.reduce((sum, entry) => sum + entry.item.payload.length, 0);
+        this.active--;
+        this.signalCapacity();
+        this.start();
+      });
+    }
+  }
+  cancel() {
+    this.closed = true;
+    if (this.timer) clearTimeout(this.timer);
+    for (const batch of [this.pending, ...this.queued]) for (const entry of batch) {
+      this.buffered -= entry.item.payload.length;
+      entry.reject(new ConnectError("stream closed", Code.Canceled));
+    }
+    this.pending = [];
+    this.queued = [];
+    this.signalCapacity();
+  }
+}
+
+function fragmentFromLocation(location: PackLocation): FragmentHeader {
+  return { flags: (location.flags & ~STORED) | DURABLE, sizePayload: location.length, sizeContent: BigInt(location.content) };
+}
+
+export async function describeFragments(scope: Scope, addresses: FragmentAddress[]) {
+  if (addresses.length > Math.floor(MAX_FRAGMENT / 48)) throw invalid("too many addresses");
+  const found = await scope.store.describeFragments(addresses.map(addressParts));
+  return found.map(item => ({ state: item.state, fragment: item.location ? fragmentFromLocation(item.location) : null, location: item.location }));
 }
 
 export async function getFragment(env: Env, scope: Scope, address: FragmentAddress, metadataOnly = false) {
-  const parts = addressParts(address);
-  if (await scope.store.matchFragment(parts.hash, parts.context) === 2) {
+  const [item] = await describeFragments(scope, [address]);
+  if (!item.location || !item.fragment) {
     throw new ConnectError("fragment not found", Code.NotFound);
   }
-  const key = objectKey(scope.id, parts.hash);
-  if (metadataOnly) {
-    const object = await env.FRAGMENTS.head(key);
-    if (!object) throw new ConnectError("fragment association has no payload", Code.DataLoss);
-    return { fragment: fragmentFromObject(object), payload: new Uint8Array() };
-  }
-  const object = await env.FRAGMENTS.get(key);
+  if (metadataOnly) return { fragment: item.fragment, payload: new Uint8Array() };
+  const object = await env.FRAGMENTS.get(item.location.key, { range: { offset: item.location.offset, length: item.location.length } });
   if (!object) throw new ConnectError("fragment association has no payload", Code.DataLoss);
-  return { fragment: fragmentFromObject(object), payload: new Uint8Array(await object.arrayBuffer()) };
+  const payload = new Uint8Array(await object.arrayBuffer());
+  if (payload.length !== item.location.length) throw new ConnectError("truncated fragment pack", Code.DataLoss);
+  return { fragment: item.fragment, payload };
 }
 
 export async function queryFragments(scope: Scope, addresses: FragmentAddress[]) {
-  if (addresses.length > Math.floor(MAX_FRAGMENT / 48)) throw invalid("too many addresses");
-  const results = [];
-  for (const address of addresses) {
-    const parts = addressParts(address);
-    results.push(await scope.store.matchFragment(parts.hash, parts.context));
-  }
-  return { results };
+  return { results: (await describeFragments(scope, addresses)).map(item => item.state) };
 }
 
 export function itemStatus(error: unknown) {

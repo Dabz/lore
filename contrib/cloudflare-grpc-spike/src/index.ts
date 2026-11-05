@@ -8,11 +8,13 @@ import { EnvironmentService } from "./gen/lore/environment/v1/environment_pb.js"
 import { StorageService } from "./gen/lore/storage/v1/storage_pb.js";
 import { RepositoryService } from "./gen/lore/repository/v1/repository_pb.js";
 import { RevisionService } from "./gen/lore/revision/v1/revision_pb.js";
-import { fromHex, getFragment, itemStatus, putFragment, queryFragments, toHex } from "./immutable.js";
+import { fromHex, getFragment, itemStatus, PackWriter, queryFragments, toHex } from "./immutable.js";
+import { packedStream } from "./stream.js";
+import { packOptions } from "./pack-options.js";
 import { branchRecord, repositoryService } from "./repository.js";
 import { verifyRevision } from "./revision.js";
-import type { BranchData, RepositoryRequest, Scope } from "./types.js";
-export { RepositoryCatalog } from "./repository.js";
+import type { BranchData, PackEntry, PackLocation, RepositoryRequest, Scope } from "./types.js";
+export { RepositoryCatalog, PackedRepositoryCatalog } from "./repository.js";
 
 const ZERO = "00".repeat(32);
 const hex = (bytes: Uint8Array) => Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
@@ -48,11 +50,15 @@ function partition(headers: Headers, env: Env): Scope {
 
 // One instance per partition. Synchronous SQLite transactions make each CAS atomic,
 // including the read of a missing key and a concurrent insert.
-export class MutablePartition extends DurableObject<Env> {
+// Retain the old class export for the existing migration; the new binding has
+// its own namespace and does not interpret old fragment associations as packs.
+export class MutablePartition extends DurableObject<Env> {}
+export class PackedMutablePartition extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS entries (type INTEGER NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (type, key))");
     this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS fragments (hash TEXT NOT NULL, context TEXT NOT NULL, PRIMARY KEY (hash, context))");
+    this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS fragment_objects (hash TEXT PRIMARY KEY, key TEXT NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL, flags INTEGER NOT NULL, content TEXT NOT NULL)");
     this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS branches (id TEXT PRIMARY KEY, name TEXT COLLATE NOCASE UNIQUE NOT NULL, record TEXT NOT NULL)");
   }
 
@@ -87,6 +93,24 @@ export class MutablePartition extends DurableObject<Env> {
   matchFragment(hash: string, context: string) {
     const matches = this.ctx.storage.sql.exec("SELECT context FROM fragments WHERE hash = ? ORDER BY context = ? DESC LIMIT 1", hash, context).toArray();
     return matches.length === 0 ? 2 : matches[0].context === context ? 0 : 1;
+  }
+
+  publishPack(entries: PackEntry[]): boolean[] {
+    return this.ctx.storage.transactionSync(() => entries.map(entry => {
+      const sql = this.ctx.storage.sql;
+      const existing = sql.exec<PackLocation>("SELECT key, offset, length, flags, content FROM fragment_objects WHERE hash = ?", entry.hash).toArray()[0];
+      if (existing && ((existing.flags & 1) !== (entry.flags & 1) || existing.content !== entry.content)) return false;
+      if (!existing) sql.exec("INSERT INTO fragment_objects (hash, key, offset, length, flags, content) VALUES (?, ?, ?, ?, ?, ?)", entry.hash, entry.key, entry.offset, entry.length, entry.flags, entry.content);
+      this.associate(entry.hash, entry.context);
+      return true;
+    }));
+  }
+
+  describeFragments(addresses: { hash: string; context: string }[]) {
+    return addresses.map(({ hash, context }) => {
+      const location = this.ctx.storage.sql.exec<PackLocation>("SELECT key, offset, length, flags, content FROM fragment_objects WHERE hash = ?", hash).toArray()[0];
+      return location ? { state: this.matchFragment(hash, context), location } : { state: 2, location: null };
+    });
   }
 
   initializeRepository(request: RepositoryRequest, created: number, metadata: string, branchHash: string) {
@@ -174,15 +198,17 @@ export default {
     router.service(StorageService, {
       async *put(requests, context) {
         const scope = partition(context.requestHeader, env);
-        for await (const req of requests) {
+        const options = packOptions(env);
+        const writer = new PackWriter(env, scope, options);
+        yield* packedStream(requests, writer, options.maxPending, async req => {
           if (!req.address) throw new ConnectError("put address is required", Code.InvalidArgument);
           try {
-            await putFragment(env, scope, req.address, req.fragment, req.payload);
-            yield { address: req.address, status: { code: 0 } };
+            await writer.add(req.address, req.fragment, req.payload);
+            return { address: req.address, status: { code: 0 } };
           } catch (error) {
-            yield { address: req.address, status: itemStatus(error) };
+            return { address: req.address, status: itemStatus(error) };
           }
-        }
+        });
       },
       async *get(requests, context) {
         const scope = partition(context.requestHeader, env);
@@ -209,19 +235,31 @@ export default {
       },
       async *putResolved(requests, context) {
         const scope = partition(context.requestHeader, env);
-        for await (const req of requests) {
+        const options = packOptions(env);
+        const writer = new PackWriter(env, scope, options);
+        const chains = new Map<string, Promise<void>>();
+        yield* packedStream(requests, writer, options.maxPending, async req => {
           if (req.requestId === 0n) throw new ConnectError("request id must be nonzero", Code.InvalidArgument);
           try {
             const key = hash(req.key, "key");
             if (key === ZERO || !req.address) throw new ConnectError("invalid key or missing address", Code.InvalidArgument);
             const target = hash(req.address.hash, "address hash");
-            if (target !== ZERO) await putFragment(env, scope, req.address, req.fragment, req.payload);
-            await scope.store.store(7, key, target);
-            yield { requestId: req.requestId, status: { code: 0 } };
+            // Start the pack write immediately, but serialize mapping updates for
+            // the same key in request order even across concurrent pack uploads.
+            const written = target === ZERO ? Promise.resolve(null) : writer.add(req.address, req.fragment, req.payload).then(() => null, error => error);
+            const previous = chains.get(key) ?? Promise.resolve();
+            const update = previous.catch(() => {}).then(async () => {
+              const error: unknown = await written;
+              if (error !== null) throw error;
+              await scope.store.store(7, key, target);
+            });
+            chains.set(key, update);
+            try { await update; } finally { if (chains.get(key) === update) chains.delete(key); }
+            return { requestId: req.requestId, status: { code: 0 } };
           } catch (error) {
-            yield { requestId: req.requestId, status: itemStatus(error) };
+            return { requestId: req.requestId, status: itemStatus(error) };
           }
-        }
+        });
       },
       async *getResolved(requests, context) {
         const scope = partition(context.requestHeader, env);

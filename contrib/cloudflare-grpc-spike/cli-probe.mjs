@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 
 const target = process.argv[2] ? new URL(process.argv[2]) : null;
 if (target && (target.protocol !== "https:" || target.pathname !== "/" || target.search || target.hash)) throw new Error("usage: node cli-probe.mjs [https://HOST]");
@@ -85,7 +85,10 @@ try {
   await lore(["repository", "create", `${url}/${name}`]);
   await lore(["repository", "list", url]);
   await writeFile(join(work, "example.txt"), "Hello from Lore on Workers.\n");
+  const large = randomBytes(8 * 1024 * 1024);
+  await writeFile(join(work, "large.bin"), large);
   await lore(["stage", "example.txt"]);
+  await lore(["stage", "large.bin"]);
   await lore(["commit", "initial commit"]);
   await lore(["push"]);
   await writeFile(join(work, "example.txt"), "A second revision on Workers.\n");
@@ -94,7 +97,8 @@ try {
   await lore(["push"]);
   await lore(["clone", `${url}/${name}`, join(temp, "clone")], temp);
   assert.equal(await readFile(join(temp, "clone", "example.txt"), "utf8"), "A second revision on Workers.\n");
-  console.log("CLI create, list, stage, commit, push and clone passed");
+  assert.deepEqual(await readFile(join(temp, "clone", "large.bin")), large);
+  console.log("CLI create, list, stage, commit, push and clone (including 8 MiB fragmented file) passed");
 } finally {
   bridge.close();
   if (remote) remote.destroy();

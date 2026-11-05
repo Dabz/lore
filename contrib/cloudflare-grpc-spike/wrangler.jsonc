@@ -2,15 +2,37 @@
   "name": "lore-worker-mvp-local",
   "main": "src/index.ts",
   "compatibility_date": "2026-10-08",
-  "build": { "command": "cargo build --locked --release --target wasm32-unknown-unknown --manifest-path core/Cargo.toml" },
+  "build": {
+    "command": "cargo build --locked --release --target wasm32-unknown-unknown --manifest-path core/Cargo.toml",
+  },
   "workers_dev": false,
-  "r2_buckets": [{ "binding": "FRAGMENTS", "bucket_name": "lore-worker-mvp-local" }],
+  "vars": {
+    "PACK_MAX_BYTES": "104857600",
+    "PACK_LINGER_MS": "1000",
+    "PACK_CONCURRENCY": "50",
+    "PACK_MAX_PENDING": "1000",
+  },
+  "r2_buckets": [
+    { "binding": "FRAGMENTS", "bucket_name": "lore-worker-mvp-local" },
+  ],
   "durable_objects": {
     "bindings": [
-      { "name": "MUTABLE", "class_name": "MutablePartition" },
-      { "name": "CATALOG", "class_name": "RepositoryCatalog" }
-    ]
+      { "name": "MUTABLE", "class_name": "PackedMutablePartition" },
+      { "name": "CATALOG", "class_name": "PackedRepositoryCatalog" },
+    ],
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MutablePartition", "RepositoryCatalog"] }],
-  "observability": { "enabled": true }
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["MutablePartition", "RepositoryCatalog"],
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["PackedMutablePartition", "PackedRepositoryCatalog"],
+    },
+  ],
+  "observability": {
+    "enabled": true,
+    "traces": { "enabled": true, "head_sampling_rate": 0.05, "persist": true },
+  },
 }

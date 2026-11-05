@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 import { Code, ConnectError } from "@connectrpc/connect";
-import { getFragment, toHex } from "./immutable.js";
+import { describeFragments, getFragment, toHex } from "./immutable.js";
 import { validMetadata } from "./core.js";
 import type { Scope } from "./types.js";
 
@@ -11,10 +11,11 @@ const hashAt = (data: Uint8Array, offset: number) => data.slice(offset, offset +
 const isZero = (data: Uint8Array) => data.every(byte => byte === 0);
 const invalid = (message: string) => new ConnectError(message, Code.FailedPrecondition);
 
-// This intentionally accepts only the simple current-format, unfragmented tree
-// subset. Anything not traversed and verified is rejected before moving a tip.
+// Structural revision fragments still use the simple current-format subset.
+// File content may be a fragment tree, verified without materializing the file.
 export async function verifyRevision(env: Env, scope: Scope, signature: Uint8Array) {
   let reads = 0;
+  let contentReferences = 0;
   async function read(hash: Uint8Array, context: Uint8Array = zeroContext) {
     if (isZero(hash)) return null;
     if (++reads > 4096) throw new ConnectError("revision exceeds MVP verification limit", Code.ResourceExhausted);
@@ -43,6 +44,52 @@ export async function verifyRevision(env: Env, scope: Scope, signature: Uint8Arr
       }
       offset += size;
     }
+  }
+  async function verifyFile(hash: Uint8Array, context: Uint8Array, expected: bigint) {
+    if (isZero(hash)) {
+      if (expected !== 0n) throw invalid("missing file content");
+      return;
+    }
+    const [root] = await describeFragments(scope, [{ hash, context }]);
+    if (!root.fragment || root.fragment.sizeContent !== expected) throw invalid("missing or invalid file content");
+    if (!(root.fragment.flags & 1)) return;
+    async function walk(hash: Uint8Array, size: bigint, start: bigint | null, depth: number): Promise<void> {
+      if (depth > 8) throw new ConnectError("fragment tree exceeds verification depth", Code.ResourceExhausted);
+      const item = await getFragment(env, scope, { hash, context });
+      const data = item.payload;
+      if (!(item.fragment.flags & 1) || item.fragment.sizeContent !== size || !data.length || data.length % 40) throw invalid("invalid fragment list");
+      const dv = view(data);
+      const base = dv.getBigUint64(32, true);
+      if (start !== null && base !== start) throw invalid("fragment sublist offset mismatch");
+      const end = base + size;
+      if (end > (1n << 64n) - 1n) throw invalid("fragment list offset overflow");
+      const count = data.length / 40;
+      contentReferences += count;
+      if (contentReferences > 100000) throw new ConnectError("file content exceeds verification limit", Code.ResourceExhausted);
+      let tier: boolean | undefined;
+      for (let first = 0; first < count; first += 512) {
+        const children = [];
+        for (let i = first; i < Math.min(first + 512, count); i++) {
+          const offset = dv.getBigUint64(i * 40 + 32, true);
+          const next = i + 1 < count ? dv.getBigUint64((i + 1) * 40 + 32, true) : end;
+          const childHash = hashAt(data, i * 40);
+          if (isZero(childHash) || next <= offset || next > end) throw invalid("invalid fragment coverage");
+          children.push({ hash: childHash, context, offset, size: next - offset });
+        }
+        const descriptions = await describeFragments(scope, children);
+        for (let i = 0; i < children.length; i++) {
+          const child = children[i];
+          const fragment = descriptions[i].fragment;
+          if (!fragment || fragment.sizeContent !== child.size) throw invalid("missing or invalid file fragment");
+          const fragmented = (fragment.flags & 1) !== 0;
+          if (tier !== undefined && tier !== fragmented) throw invalid("mixed fragment tree tiers");
+          tier = fragmented;
+          if (fragmented) await walk(child.hash, child.size, child.offset, depth + 1);
+          else if (child.size > 256n * 1024n) throw invalid("file fragment exceeds size limit");
+        }
+      }
+    }
+    await walk(hash, expected, null, 0);
   }
   const state = await read(signature);
   if (!state || state.length !== 320 || view(state).getUint32(0, true) !== 0xd37a208e || view(state).getUint32(4, true) !== 2) throw invalid("invalid revision state");
@@ -92,9 +139,8 @@ export async function verifyRevision(env: Env, scope: Scope, signature: Uint8Arr
       if (flags & 2) throw new ConnectError("linked trees are not supported yet", Code.Unimplemented);
       if (flags & 1) {
         const fileHash = hashAt(block, offset + 48);
-        const file = await read(fileHash, block.slice(offset + 80, offset + 96));
         const expected = blockView.getBigUint64(offset + 40, true);
-        if ((!file && expected !== 0n) || (file && BigInt(file.length) !== expected)) throw invalid("missing or invalid file content");
+        await verifyFile(fileHash, block.slice(offset + 80, offset + 96), expected);
       }
       if (metadataBlock) await metadata(hashAt(metadataBlock, 32 + i * 128));
     }

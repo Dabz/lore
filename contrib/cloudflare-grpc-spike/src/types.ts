@@ -1,11 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 import type { Address, Fragment } from "./gen/lore/model/v1/model_pb.js";
-import type { MutablePartition } from "./index.js";
+import type { PackedMutablePartition } from "./index.js";
 
 export type FragmentAddress = Pick<Address, "hash" | "context">;
 export type FragmentHeader = Pick<Fragment, "flags" | "sizePayload" | "sizeContent">;
-export type Scope = { id: string; store: DurableObjectStub<MutablePartition> };
+export type Scope = { id: string; store: DurableObjectStub<PackedMutablePartition> };
+export type PackEntry = { hash: string; context: string; key: string; offset: number; length: number; flags: number; content: string };
+export type PackLocation = Omit<PackEntry, "hash" | "context">;
 export type RepositoryRequest = {
   id: string;
   name: string;

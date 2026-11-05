@@ -90,6 +90,16 @@ function stream(method, inputSchema, outputSchema, repo = partition) {
       assert.equal(result[0], 0);
       return fromBinary(outputSchema, Uint8Array.from(result.subarray(5)));
     },
+    async sendMany(values) {
+      for (const value of values) request.write(frame(toBinary(inputSchema, create(inputSchema, value))));
+      const results = [];
+      for (const _ of values) {
+        const result = await next();
+        assert.equal(result[0], 0);
+        results.push(fromBinary(outputSchema, Uint8Array.from(result.subarray(5))));
+      }
+      return results;
+    },
     async close() {
       request.end();
       const trailer = await next();
@@ -106,6 +116,12 @@ async function query(addresses, repo = partition) {
   const wire = Buffer.from(await response.arrayBuffer());
   assert.equal(wire[0], 0);
   return fromBinary(QueryResponseSchema, Uint8Array.from(wire.subarray(5, 5 + wire.readUInt32BE(1)))).results;
+}
+async function packObjects() {
+  const response = await fetch(`${origin}/cdn-cgi/local/explorer/api/r2/buckets/lore-worker-mvp-local/objects`);
+  const data = await response.json();
+  assert.equal(data.success, true);
+  return data.result;
 }
 async function call(service, method, inputSchema, outputSchema, value, repo = partition) {
   const response = await fetch(`${origin}/lore.${service}.v1.${service === "repository" ? "Repository" : "Revision"}Service/${method}`, {
@@ -177,10 +193,48 @@ try {
   const root = { hash: blake3(references), context: ctx };
   const rootFragment = { flags: 1, sizePayload: 80, sizeContent: 400n };
   assert.equal((await put.send({ address: root, fragment: rootFragment, payload: references })).status.code, 0);
+  assert.equal((await put.send({ address: root, fragment: { flags: 0, sizePayload: 80, sizeContent: 80n }, payload: references })).status.code, 6);
   const badRefs = references.slice();
   new DataView(badRefs.buffer).setBigUint64(72, 0n, true);
   assert.equal((await put.send({ address: { hash: blake3(badRefs), context: ctx }, fragment: rootFragment, payload: badRefs })).status.code, 3);
   await put.close();
+  // Send more than two full packs without waiting per item. A malformed item
+  // must fail independently, and all published ranges must remain readable.
+  const packed = Array.from({ length: 130 }, (_, i) => {
+    const data = new Uint8Array(65536).fill(i);
+    new DataView(data.buffer).setUint32(0, i, true);
+    return { address: { hash: blake3(data), context: ctx }, fragment: { flags: 0, sizePayload: data.length, sizeContent: BigInt(data.length) }, payload: data };
+  });
+  const beforePacks = new Set((await packObjects()).map(object => object.key));
+  const bulk = stream("Put", PutRequestSchema, PutResponseSchema);
+  const results = await bulk.sendMany([...packed, { ...packed[0], payload: new Uint8Array(1) }]);
+  assert.equal(results.filter(result => result.status.code === 0).length, packed.length);
+  assert.equal(results.filter(result => result.status.code === 3).length, 1);
+  await bulk.close();
+  const newPacks = (await packObjects()).filter(object => !beforePacks.has(object.key));
+  assert.ok(newPacks.length >= 2 && newPacks.length < packed.length);
+  assert.equal(newPacks.reduce((sum, object) => sum + object.size, 0), packed.length * 65536);
+  assert.ok(newPacks.some(object => object.size > 65536));
+  assert.deepEqual(await query(packed.map(item => item.address)), packed.map(() => 0));
+  const packedGet = stream("Get", AddressSchema, GetResponseSchema);
+  for (const i of [0, 1, 63, 64, 129]) assert.deepEqual((await packedGet.send(packed[i].address)).payload, packed[i].payload);
+  await packedGet.close();
+  // Concurrent representations of the same hash must elect exactly one and
+  // must not publish the losing context.
+  const raceData = new Uint8Array(80);
+  raceData.set(packed[3].address.hash, 0);
+  raceData.set(packed[4].address.hash, 40);
+  new DataView(raceData.buffer).setBigUint64(72, 200n, true);
+  const raceHash = blake3(raceData);
+  const raceA = stream("Put", PutRequestSchema, PutResponseSchema);
+  const raceB = stream("Put", PutRequestSchema, PutResponseSchema);
+  const race = await Promise.all([
+    raceA.send({ address: { hash: raceHash, context: ctx }, fragment: { flags: 1, sizePayload: 80, sizeContent: 400n }, payload: raceData }),
+    raceB.send({ address: { hash: raceHash, context: sibling }, fragment: { flags: 0, sizePayload: 80, sizeContent: 80n }, payload: raceData }),
+  ]);
+  assert.deepEqual(race.map(result => result.status.code).sort(), [0, 6]);
+  assert.deepEqual(await query([{ hash: raceHash, context: ctx }, { hash: raceHash, context: sibling }]), race.map(result => result.status.code === 0 ? 0 : 1));
+  await Promise.all([raceA.close(), raceB.close()]);
   const otherContext = { ...address, context: sibling };
   assert.deepEqual(await query([address, otherContext, root]), [0, 1, 0]);
   assert.deepEqual(await query([address], otherPartition), [2]);
@@ -212,6 +266,13 @@ try {
   assert.deepEqual(resolved.resolved, address.hash);
   assert.deepEqual(resolved.payload, payload);
   await resolve.close();
+  const ordered = stream("PutResolved", PutResolvedRequestSchema, PutResolvedResponseSchema);
+  const writes = [packed[0], packed[1], packed[2]].map((item, i) => ({ ...item, key, requestId: BigInt(i + 10) }));
+  assert.ok((await ordered.sendMany(writes)).every(result => result.status.code === 0));
+  await ordered.close();
+  const resolvedLast = stream("GetResolved", GetResolvedRequestSchema, GetResolvedResponseSchema);
+  assert.deepEqual((await resolvedLast.send({ requestId: 20n, key: { hash: key, context: ctx } })).resolved, packed[2].address.hash);
+  await resolvedLast.close();
 
   // A missing referenced tree must not advance the branch. Two independently
   // verified revision-1 pushes racing from the same tip must have one winner.
@@ -234,8 +295,40 @@ try {
   }
   const missing = await putPlain(state(new Uint8Array(32).fill(99), repository.metadata));
   assert.match((await push(missing)).trailer, /grpc-status:\s*9\b/i);
+  // A 5,000-leaf file exceeds the old 4,096-read limit. Reusing the same
+  // 64-KiB leaf exercises a 312-MiB logical file without allocating it.
+  const fileRefs = new Uint8Array(5000 * 40);
+  const refView = new DataView(fileRefs.buffer);
+  for (let i = 0; i < 5000; i++) {
+    fileRefs.set(packed[0].address.hash, i * 40);
+    refView.setBigUint64(i * 40 + 32, BigInt(i * 65536), true);
+  }
+  const fileRoot = { hash: blake3(fileRefs), context: ctx };
+  const fileFragment = { flags: 1, sizePayload: fileRefs.length, sizeContent: 5000n * 65536n };
+  assert.equal((await upload.send({ address: fileRoot, fragment: fileFragment, payload: fileRefs })).status.code, 0);
+  const badFileRefs = fileRefs.slice();
+  badFileRefs.set(new Uint8Array(32).fill(91), 4999 * 40);
+  const badFileRoot = { hash: blake3(badFileRefs), context: ctx };
+  assert.equal((await upload.send({ address: badFileRoot, fragment: fileFragment, payload: badFileRefs })).status.code, 0);
   const block = new Uint8Array(49280);
   new DataView(block.buffer).setUint32(4, 1, true);
+  const bv = new DataView(block.buffer);
+  bv.setUint16(128, 1, true);
+  bv.setBigUint64(128 + 40, fileFragment.sizeContent, true);
+  block.set(fileRoot.hash, 128 + 48);
+  block.set(ctx, 128 + 80);
+  const badBlock = block.slice();
+  badBlock.set(badFileRoot.hash, 128 + 48);
+  const badBlockHash = await putPlain(badBlock);
+  const badNodesHash = await putPlain(badBlockHash);
+  const badTree = new Uint8Array(288);
+  const badTreeView = new DataView(badTree.buffer);
+  badTreeView.setUint32(0, 0x3c71bf05, true);
+  badTreeView.setUint32(4, 1, true);
+  badTreeView.setUint32(12, 1, true);
+  badTree.set(badNodesHash, 64);
+  const badRevision = await putPlain(state(await putPlain(badTree), repository.metadata));
+  assert.match((await push(badRevision)).trailer, /grpc-status:\s*9\b/i);
   const blockHash = await putPlain(block);
   const nodesHash = await putPlain(blockHash);
   const tree = new Uint8Array(288);
@@ -260,8 +353,9 @@ try {
   assert.deepEqual(await query([address, otherContext, root]), [0, 0, 0]);
   const afterRestart = stream("Get", AddressSchema, GetResponseSchema);
   assert.deepEqual((await afterRestart.send(address)).payload, payload);
+  assert.deepEqual((await afterRestart.send(packed[64].address)).payload, packed[64].payload);
   await afterRestart.close();
-  console.log("Immutable gRPC-web: validation, concurrent push, association, copy, resolved and restart persistence passed");
+  console.log("Immutable gRPC-web: packed writes/ranges, 5000-leaf verification, concurrent push, copy, resolved ordering and restart persistence passed");
 } finally {
   await stop();
   await rm(state, { recursive: true, force: true });

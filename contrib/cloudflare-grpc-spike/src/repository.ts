@@ -60,6 +60,8 @@ export class RepositoryCatalog extends DurableObject<Env> {
   }
 }
 
+export class PackedRepositoryCatalog extends RepositoryCatalog {}
+
 function catalog(env: Env) { return env.CATALOG.getByName("repositories"); }
 async function writeMetadata(env: Env, scope: Scope, payload: Uint8Array) {
   const address = { hash: loreHash(payload), context: ZERO_CONTEXT };
