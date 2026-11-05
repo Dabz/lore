@@ -218,6 +218,17 @@ try {
   assert.deepEqual(await query(packed.map(item => item.address)), packed.map(() => 0));
   const packedGet = stream("Get", AddressSchema, GetResponseSchema);
   for (const i of [0, 1, 63, 64, 129]) assert.deepEqual((await packedGet.send(packed[i].address)).payload, packed[i].payload);
+  // Responses may arrive out of order, including across the pending limit.
+  const bulkRead = await packedGet.sendMany(packed.map(item => item.address));
+  const byHash = new Map(packed.map(item => [Buffer.from(item.address.hash).toString("hex"), item.payload]));
+  assert.equal(bulkRead.length, packed.length);
+  for (const response of bulkRead) {
+    assert.equal(response.status.code, 0);
+    const hash = Buffer.from(response.address.hash).toString("hex");
+    assert.deepEqual(response.payload, byHash.get(hash));
+    byHash.delete(hash);
+  }
+  assert.equal(byHash.size, 0);
   await packedGet.close();
   // Concurrent representations of the same hash must elect exactly one and
   // must not publish the losing context.
@@ -272,7 +283,42 @@ try {
   await ordered.close();
   const resolvedLast = stream("GetResolved", GetResolvedRequestSchema, GetResolvedResponseSchema);
   assert.deepEqual((await resolvedLast.send({ requestId: 20n, key: { hash: key, context: ctx } })).resolved, packed[2].address.hash);
+  const resolvedBatch = await resolvedLast.sendMany([
+    { requestId: 21n, key: { hash: key, context: ctx } },
+    { requestId: 22n, key: { hash: new Uint8Array(32).fill(77), context: ctx } },
+    { requestId: 23n, key: { hash: key, context: ctx }, flags: 1 },
+  ]);
+  const resolvedById = new Map(resolvedBatch.map(result => [result.requestId, result]));
+  assert.deepEqual(resolvedById.get(21n).payload, packed[2].payload);
+  assert.equal(resolvedById.get(22n).status.code, 5);
+  assert.equal(resolvedById.get(23n).status.code, 12);
   await resolvedLast.close();
+
+  // Publishing a fragmented value repacks its leaves in logical order. The
+  // inputs were uploaded in the opposite order, so this must create new packs.
+  const reverseRefs = new Uint8Array(packed.length * 40);
+  const reverseView = new DataView(reverseRefs.buffer);
+  for (let i = 0; i < packed.length; i++) {
+    reverseRefs.set(packed[packed.length - 1 - i].address.hash, i * 40);
+    reverseView.setBigUint64(i * 40 + 32, BigInt(i * 65536), true);
+  }
+  const reverseRoot = { hash: blake3(reverseRefs), context: ctx };
+  const reverseFragment = { flags: 1, sizePayload: reverseRefs.length, sizeContent: BigInt(packed.length * 65536) };
+  const beforeRepack = new Set((await packObjects()).map(object => object.key));
+  const publishTree = stream("PutResolved", PutResolvedRequestSchema, PutResolvedResponseSchema);
+  assert.equal((await publishTree.send({ requestId: 1n, key: new Uint8Array(32).fill(43), address: reverseRoot, fragment: reverseFragment, payload: reverseRefs })).status.code, 0);
+  await publishTree.close();
+  const repackedObjects = (await packObjects()).filter(object => !beforeRepack.has(object.key));
+  assert.ok(repackedObjects.some(object => object.size === 8 * 1024 * 1024));
+  const repackedGet = stream("Get", AddressSchema, GetResponseSchema);
+  const repackedResponses = await repackedGet.sendMany(packed.map(item => item.address));
+  const repackedByHash = new Map(packed.map(item => [Buffer.from(item.address.hash).toString("hex"), item.payload]));
+  assert.equal(repackedResponses.length, packed.length);
+  for (const response of repackedResponses) {
+    assert.equal(response.status.code, 0);
+    assert.deepEqual(response.payload, repackedByHash.get(Buffer.from(response.address.hash).toString("hex")));
+  }
+  await repackedGet.close();
 
   // A missing referenced tree must not advance the branch. Two independently
   // verified revision-1 pushes racing from the same tip must have one winner.

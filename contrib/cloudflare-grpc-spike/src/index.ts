@@ -8,15 +8,21 @@ import { EnvironmentService } from "./gen/lore/environment/v1/environment_pb.js"
 import { StorageService } from "./gen/lore/storage/v1/storage_pb.js";
 import { RepositoryService } from "./gen/lore/repository/v1/repository_pb.js";
 import { RevisionService } from "./gen/lore/revision/v1/revision_pb.js";
-import { fromHex, getFragment, itemStatus, PackWriter, queryFragments, toHex } from "./immutable.js";
+import { fromHex, getFragment, getFragments, itemStatus, PackWriter, queryFragments, ReadRangeScheduler, toHex } from "./immutable.js";
 import { packedStream } from "./stream.js";
+import { ReadMetrics, readOptions, readStream } from "./read-stream.js";
+import { ReadAheadCache } from "./read-cache.js";
 import { packOptions } from "./pack-options.js";
 import { branchRecord, repositoryService } from "./repository.js";
 import { verifyRevision } from "./revision.js";
-import type { BranchData, PackEntry, PackLocation, RepositoryRequest, Scope } from "./types.js";
+import { repackTree } from "./repack.js";
+import type { BranchData, FragmentAddress, FragmentHeader, PackEntry, PackLocation, PackRelocation, RepositoryRequest, Scope } from "./types.js";
+import type { GetResolvedRequest } from "./gen/lore/storage/v1/storage_pb.js";
 export { RepositoryCatalog, PackedRepositoryCatalog } from "./repository.js";
 
 const ZERO = "00".repeat(32);
+type GetReply = { address: FragmentAddress; fragment?: FragmentHeader; payload?: Uint8Array; status: { code: number; message?: string } };
+type ResolvedReply = { requestId: bigint; resolved?: Uint8Array; fragment?: FragmentHeader; payload?: Uint8Array; status: { code: number; message?: string } };
 const hex = (bytes: Uint8Array) => Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
 const bytes = (value: string) => Uint8Array.from(value.match(/../g)!, part => parseInt(part, 16));
 
@@ -66,6 +72,10 @@ export class PackedMutablePartition extends DurableObject<Env> {
     return this.ctx.storage.sql.exec<{ value: string }>("SELECT value FROM entries WHERE type = ? AND key = ?", type, key).toArray()[0]?.value ?? null;
   }
 
+  loadMany(type: number, keys: string[]) {
+    return keys.map(key => this.load(type, key));
+  }
+
   store(type: number, key: string, value: string) {
     if (value === ZERO) {
       this.ctx.storage.sql.exec("DELETE FROM entries WHERE type = ? AND key = ?", type, key);
@@ -104,6 +114,18 @@ export class PackedMutablePartition extends DurableObject<Env> {
       this.associate(entry.hash, entry.context);
       return true;
     }));
+  }
+
+  relocatePack(entries: PackRelocation[]): number {
+    return this.ctx.storage.transactionSync(() => {
+      let moved = 0;
+      for (const entry of entries) {
+        const old = entry.old;
+        const result = this.ctx.storage.sql.exec("UPDATE fragment_objects SET key = ?, offset = ? WHERE hash = ? AND key = ? AND offset = ? AND length = ? AND flags = ? AND content = ?", entry.key, entry.offset, entry.hash, old.key, old.offset, old.length, old.flags, old.content);
+        moved += result.rowsWritten;
+      }
+      return moved;
+    });
   }
 
   describeFragments(addresses: { hash: string; context: string }[]) {
@@ -212,23 +234,28 @@ export default {
       },
       async *get(requests, context) {
         const scope = partition(context.requestHeader, env);
-        for await (const address of requests) {
-          try {
-            yield { address, ...await getFragment(env, scope, address), status: { code: 0 } };
-          } catch (error) {
-            yield { address, status: itemStatus(error) };
-          }
-        }
+        const options = readOptions(env);
+        const metrics = new ReadMetrics("Get", options);
+        const cache = options.readAheadBytes ? new ReadAheadCache(options.readAheadBytes, options.cacheBytes, metrics) : undefined;
+        let scheduler: ReadRangeScheduler | undefined;
+        try { yield* readStream<FragmentAddress, GetReply>(requests, options, async (batch, emit, limiter, budget) => {
+          scheduler ??= new ReadRangeScheduler(env, scope, options, limiter, metrics, cache, budget);
+          await getFragments(env, scope, batch, false, options, limiter, (i, result, release) => {
+            metrics.result(result);
+            emit("error" in result ? { address: batch[i], status: itemStatus(result.error) } : { address: batch[i], ...result, status: { code: 0 } }, release);
+          }, metrics, cache, budget, scheduler);
+        }, metrics); } finally { scheduler?.close(); cache?.close(); }
       },
       async *getMetadata(requests, context) {
         const scope = partition(context.requestHeader, env);
-        for await (const address of requests) {
-          try {
-            yield { address, ...await getFragment(env, scope, address, true), status: { code: 0 } };
-          } catch (error) {
-            yield { address, status: itemStatus(error) };
-          }
-        }
+        const options = readOptions(env);
+        const metrics = new ReadMetrics("GetMetadata", options);
+        yield* readStream<FragmentAddress, GetReply>(requests, options, async (batch, emit, limiter) => {
+          await getFragments(env, scope, batch, true, options, limiter, (i, result) => {
+            metrics.result(result);
+            emit("error" in result ? { address: batch[i], status: itemStatus(result.error) } : { address: batch[i], ...result, status: { code: 0 } });
+          }, metrics);
+        }, metrics);
       },
       async query(req, context) {
         return queryFragments(partition(context.requestHeader, env), req.addresses);
@@ -251,6 +278,10 @@ export default {
             const update = previous.catch(() => {}).then(async () => {
               const error: unknown = await written;
               if (error !== null) throw error;
+              if (target !== ZERO && req.fragment && (req.fragment.flags & 1) && req.fragment.sizeContent >= 4n * 1024n * 1024n) {
+                try { await repackTree(env, scope, req.address!); }
+                catch (error) { console.error({ event: "repack_failed", partition: scope.id, error: String(error) }); }
+              }
               await scope.store.store(7, key, target);
             });
             chains.set(key, update);
@@ -263,19 +294,39 @@ export default {
       },
       async *getResolved(requests, context) {
         const scope = partition(context.requestHeader, env);
-        for await (const req of requests) {
-          if (req.requestId === 0n) throw new ConnectError("request id must be nonzero", Code.InvalidArgument);
-          try {
-            if (req.flags !== 0) throw new ConnectError("unsupported flags", Code.Unimplemented);
-            if (!req.key) throw new ConnectError("key is required", Code.InvalidArgument);
-            const resolved = await scope.store.load(7, hash(req.key.hash, "key"));
-            if (resolved === null) throw new ConnectError("mutable key not found", Code.NotFound);
-            const data = await getFragment(env, scope, { hash: fromHex(resolved), context: req.key.context });
-            yield { requestId: req.requestId, resolved: fromHex(resolved), ...data, status: { code: 0 } };
-          } catch (error) {
-            yield { requestId: req.requestId, status: itemStatus(error) };
+        const options = readOptions(env);
+        const metrics = new ReadMetrics("GetResolved", options);
+        const cache = options.readAheadBytes ? new ReadAheadCache(options.readAheadBytes, options.cacheBytes, metrics) : undefined;
+        let scheduler: ReadRangeScheduler | undefined;
+        try { yield* readStream<GetResolvedRequest, ResolvedReply>(requests, options, async (batch, emit, limiter, budget) => {
+          scheduler ??= new ReadRangeScheduler(env, scope, options, limiter, metrics, cache, budget);
+          if (batch.some(req => req.requestId === 0n)) throw new ConnectError("request id must be nonzero", Code.InvalidArgument);
+          const valid: Array<{ req: GetResolvedRequest; key: string }> = [];
+          for (const req of batch) {
+            try {
+              if (req.flags !== 0) throw new ConnectError("unsupported flags", Code.Unimplemented);
+              if (!req.key) throw new ConnectError("key is required", Code.InvalidArgument);
+              valid.push({ req, key: hash(req.key.hash, "key") });
+            } catch (error) { metrics.result({ error }); emit({ requestId: req.requestId, status: itemStatus(error) }); }
           }
-        }
+          let values: Array<string | null>;
+          try { values = valid.length ? await scope.store.loadMany(7, valid.map(item => item.key)) : []; }
+          catch (error) { for (const item of valid) { metrics.result({ error }); emit({ requestId: item.req.requestId, status: itemStatus(error) }); } return; }
+          const found: Array<{ req: GetResolvedRequest; address: FragmentAddress }> = [];
+          for (const [i, item] of valid.entries()) {
+            const value = values[i];
+            if (value === null) {
+              const error = new ConnectError("mutable key not found", Code.NotFound);
+              metrics.result({ error });
+              emit({ requestId: item.req.requestId, status: itemStatus(error) });
+            } else found.push({ req: item.req, address: { hash: fromHex(value), context: item.req.key!.context } });
+          }
+          await getFragments(env, scope, found.map(item => item.address), false, options, limiter, (i, result, release) => {
+            const item = found[i];
+            metrics.result(result);
+            emit("error" in result ? { requestId: item.req.requestId, status: itemStatus(result.error) } : { requestId: item.req.requestId, resolved: item.address.hash, ...result, status: { code: 0 } }, release);
+          }, metrics, cache, budget, scheduler);
+        }, metrics); } finally { scheduler?.close(); cache?.close(); }
       },
       async *copy(requests, context) {
         const scope = partition(context.requestHeader, env);

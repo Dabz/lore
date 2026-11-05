@@ -3,6 +3,7 @@
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describeFragments, getFragment, toHex } from "./immutable.js";
 import { validMetadata } from "./core.js";
+import { repackTree } from "./repack.js";
 import type { Scope } from "./types.js";
 
 const zeroContext = new Uint8Array(16);
@@ -90,6 +91,10 @@ export async function verifyRevision(env: Env, scope: Scope, signature: Uint8Arr
       }
     }
     await walk(hash, expected, null, 0);
+    if (expected >= 4n * 1024n * 1024n) {
+      try { await repackTree(env, scope, { hash, context }); }
+      catch (error) { console.error({ event: "repack_failed", partition: scope.id, error: String(error) }); }
+    }
   }
   const state = await read(signature);
   if (!state || state.length !== 320 || view(state).getUint32(0, true) !== 0xd37a208e || view(state).getUint32(4, true) !== 2) throw invalid("invalid revision state");

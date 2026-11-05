@@ -5,6 +5,8 @@ import { Decompress } from "fzstd";
 import { loreHash, validFragmentList, validFragmentMetadata } from "./core.js";
 import type { FragmentAddress, FragmentHeader, PackEntry, PackLocation, Scope } from "./types.js";
 import type { PackOptions } from "./pack-options.js";
+import type { PayloadBudget, ReadLimiter, ReadMetrics, ReadOptions } from "./read-stream.js";
+import type { ReadAheadCache } from "./read-cache.js";
 
 const MAX_FRAGMENT = 256 * 1024;
 const STORED = 0x1c0000;
@@ -226,6 +228,140 @@ export async function getFragment(env: Env, scope: Scope, address: FragmentAddre
   const payload = new Uint8Array(await object.arrayBuffer());
   if (payload.length !== item.location.length) throw new ConnectError("truncated fragment pack", Code.DataLoss);
   return { fragment: item.fragment, payload };
+}
+
+type ReadResult = { fragment: FragmentHeader; payload: Uint8Array } | { error: unknown };
+type LocatedRead = { location: PackLocation; fragment: FragmentHeader; emit: (result: ReadResult, release?: () => void) => void };
+
+// Collect locations from successive index lookups while the current wave of
+// payloads is being fetched. One sorted wave can then merge ranges that arrived
+// in different lookup batches, without holding payloads for the next wave.
+export class ReadRangeScheduler {
+  private pending: Array<{ items: LocatedRead[]; resolve: () => void; reject: (error: unknown) => void }> = [];
+  private running = false;
+  private closed = false;
+  private timer: ReturnType<typeof setTimeout> | undefined;
+  constructor(private env: Env, private scope: Scope, private options: ReadOptions, private limiter: ReadLimiter, private metrics?: ReadMetrics, private cache?: ReadAheadCache, private budget?: PayloadBudget) {}
+  submit(items: LocatedRead[]): Promise<void> {
+    if (!items.length || this.closed) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      this.pending.push({ items, resolve, reject });
+      if (!this.running && !this.timer) this.timer = setTimeout(() => this.flush(), Math.min(this.options.lingerMs, 5));
+    });
+  }
+  private flush() {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+    if (this.closed || this.running || !this.pending.length) return;
+    const batch = this.pending.splice(0);
+    const items = batch.flatMap(entry => entry.items);
+    this.running = true;
+    if (this.metrics) { this.metrics.rangeWaves++; this.metrics.rangeWaveItems += items.length; this.metrics.maxRangeWaveItems = Math.max(this.metrics.maxRangeWaveItems, items.length); }
+    void fetchLocated(this.env, this.scope, items, this.options, this.limiter, this.metrics, this.cache, this.budget).then(
+      () => batch.forEach(entry => entry.resolve()),
+      error => batch.forEach(entry => entry.reject(error)),
+    ).finally(() => { this.running = false; if (!this.closed && this.pending.length) this.flush(); });
+  }
+  close() {
+    this.closed = true;
+    if (this.timer) clearTimeout(this.timer);
+    for (const entry of this.pending.splice(0)) entry.resolve();
+  }
+}
+
+// Resolve a batch with one DO call, then merge overlapping or adjacent ranges.
+// A stream-local cache may also read ahead in the same immutable pack.
+export async function getFragments(env: Env, scope: Scope, addresses: FragmentAddress[], metadataOnly: boolean, options: ReadOptions, limiter: ReadLimiter, emit: (index: number, result: ReadResult, release?: () => void) => void, metrics?: ReadMetrics, cache?: ReadAheadCache, budget?: PayloadBudget, scheduler?: ReadRangeScheduler) {
+  const valid: Array<{ index: number; address: FragmentAddress }> = [];
+  for (const [index, address] of addresses.entries()) {
+    try { addressParts(address); valid.push({ index, address }); }
+    catch (error) { emit(index, { error }); }
+  }
+  if (!valid.length) return;
+  let descriptions: Awaited<ReturnType<typeof describeFragments>>;
+  const indexStart = Date.now();
+  if (metrics) { metrics.indexCalls++; metrics.indexItems += valid.length; }
+  try { descriptions = await describeFragments(scope, valid.map(item => item.address)); }
+  catch (error) { if (metrics) metrics.indexErrors++; for (const item of valid) emit(item.index, { error }); return; }
+  finally { if (metrics) metrics.indexMs += Date.now() - indexStart; }
+  const located: LocatedRead[] = [];
+  for (const [i, item] of valid.entries()) {
+    const { location, fragment } = descriptions[i];
+    if (!location || !fragment) emit(item.index, { error: new ConnectError("fragment not found", Code.NotFound) });
+    else if (metadataOnly) emit(item.index, { fragment, payload: new Uint8Array() });
+    else if (!Number.isSafeInteger(location.length) || location.length < 0 || location.length > MAX_FRAGMENT) emit(item.index, { error: new ConnectError("invalid indexed fragment length", Code.DataLoss) });
+    else located.push({ location, fragment, emit: (result, release) => emit(item.index, result, release) });
+  }
+  if (scheduler) return scheduler.submit(located);
+  return fetchLocated(env, scope, located, options, limiter, metrics, cache, budget);
+}
+
+async function fetchLocated(env: Env, scope: Scope, located: LocatedRead[], options: ReadOptions, limiter: ReadLimiter, metrics?: ReadMetrics, cache?: ReadAheadCache, budget?: PayloadBudget) {
+  located.sort((a, b) => a.location.key.localeCompare(b.location.key) || a.location.offset - b.location.offset);
+  const groups: Array<{ key: string; start: number; end: number; payloadBytes: number; coveredBytes: number; items: LocatedRead[] }> = [];
+  for (const item of located) {
+    const { key, offset, length } = item.location;
+    const previous = groups[groups.length - 1];
+    const end = offset + length;
+    // Keep merged ranges inside one cache window. Otherwise adjacent fragments
+    // straddling a boundary would bypass the cache as a large, unbudgeted read.
+    const sameWindow = !cache || (previous && Math.floor(previous.start / options.readAheadBytes) === Math.floor((Math.max(previous.end, end) - 1) / options.readAheadBytes));
+    const mergedLength = previous ? Math.max(previous.end, end) - previous.start : 0;
+    const fitsBudget = !budget || (previous && mergedLength + previous.payloadBytes + length <= budget.limit);
+    const gap = previous ? Math.max(0, offset - previous.end) : 0;
+    // Permit small holes only when the entire range is at least 80% requested
+    // payload. This trades bounded overfetch for fewer R2 round trips.
+    const covered = previous ? previous.coveredBytes + Math.max(0, end - Math.max(offset, previous.end)) : 0;
+    const efficient = previous && (gap === 0 || mergedLength * 4 <= covered * 5);
+    if (previous && previous.key === key && gap <= options.maxGapBytes && efficient && sameWindow && fitsBudget && mergedLength <= options.maxCoalescedBytes) {
+      previous.end = Math.max(previous.end, end);
+      previous.payloadBytes += length;
+      previous.coveredBytes = covered;
+      previous.items.push(item);
+    } else groups.push({ key, start: offset, end, payloadBytes: length, coveredBytes: length, items: [item] });
+  }
+  await Promise.all(groups.map(async group => {
+    const length = group.end - group.start;
+    const fetch = (offset: number, readLength: number) => limiter.run(async () => {
+      const startTime = Date.now();
+      if (metrics) {
+        metrics.r2Reads++; metrics.r2Items += group.items.length; metrics.r2RequestedBytes += readLength;
+        metrics.maxRangeBytes = Math.max(metrics.maxRangeBytes, readLength);
+      }
+      try {
+        const object = await env.FRAGMENTS.get(group.key, { range: { offset, length: readLength } });
+        if (!object) {
+          console.error(JSON.stringify({ message: "indexed fragment pack missing", partition: scope.id, key: group.key, offset, length: readLength }));
+          throw new ConnectError("fragment association has no payload", Code.DataLoss);
+        }
+        const data = new Uint8Array(await object.arrayBuffer());
+        if (metrics) metrics.r2ReceivedBytes += data.length;
+        // R2 legitimately returns fewer bytes at EOF, but a short body before
+        // EOF must not be cached as if it were complete.
+        if (data.length !== Math.min(readLength, Math.max(0, object.size - offset))) throw new ConnectError("truncated fragment pack", Code.DataLoss);
+        return data;
+      } catch (error) { if (metrics) metrics.r2Errors++; throw error; }
+      finally { if (metrics) { metrics.r2Completed++; metrics.r2Ms += Date.now() - startTime; } }
+    });
+    let reserved = false;
+    let remainingPayload = group.payloadBytes;
+    try {
+      if (budget) { await budget.reserve(length + group.payloadBytes); reserved = true; }
+      const data = cache ? await cache.read(group.key, group.start, length, group.items.length, fetch) : await fetch(group.start, length);
+      if (data.length !== length) throw new ConnectError("truncated fragment pack", Code.DataLoss);
+      for (const item of group.items) {
+        const start = item.location.offset - group.start;
+        // Copy each response so one slow response cannot retain an entire
+        // coalesced range after the other items have left the pending budget.
+        const payload = data.slice(start, start + item.location.length);
+        remainingPayload -= payload.length;
+        item.emit({ fragment: item.fragment, payload }, budget ? () => budget.release(payload.length) : undefined);
+      }
+    } catch (error) {
+      if (reserved && budget) budget.release(remainingPayload);
+      for (const item of group.items) item.emit({ error });
+    } finally { if (reserved && budget) budget.release(length); }
+  }));
 }
 
 export async function queryFragments(scope: Scope, addresses: FragmentAddress[]) {

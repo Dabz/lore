@@ -11,6 +11,15 @@
     "PACK_LINGER_MS": "1000",
     "PACK_CONCURRENCY": "50",
     "PACK_MAX_PENDING": "1000",
+    "READ_BATCH_SIZE": "512",
+    "READ_MAX_PENDING": "2048",
+    "READ_MAX_PAYLOAD_BYTES": "16777216",
+    "READ_CONCURRENCY": "6",
+    "READ_MAX_COALESCED_BYTES": "8388608",
+    "READ_MAX_GAP_BYTES": "65536",
+    "READ_AHEAD_BYTES": "1048576",
+    "READ_CACHE_BYTES": "16777216",
+    "READ_LINGER_MS": "5",
   },
   "r2_buckets": [
     { "binding": "FRAGMENTS", "bucket_name": "lore-worker-mvp-local" },
@@ -28,7 +37,10 @@
     },
     {
       "tag": "v2",
-      "new_sqlite_classes": ["PackedMutablePartition", "PackedRepositoryCatalog"],
+      "new_sqlite_classes": [
+        "PackedMutablePartition",
+        "PackedRepositoryCatalog",
+      ],
     },
   ],
   "observability": {

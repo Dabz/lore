@@ -8,6 +8,7 @@ export type FragmentHeader = Pick<Fragment, "flags" | "sizePayload" | "sizeConte
 export type Scope = { id: string; store: DurableObjectStub<PackedMutablePartition> };
 export type PackEntry = { hash: string; context: string; key: string; offset: number; length: number; flags: number; content: string };
 export type PackLocation = Omit<PackEntry, "hash" | "context">;
+export type PackRelocation = { hash: string; old: PackLocation; key: string; offset: number };
 export type RepositoryRequest = {
   id: string;
   name: string;
