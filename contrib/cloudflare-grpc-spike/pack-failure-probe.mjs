@@ -16,7 +16,7 @@ const bundle = await build({
     ` }));
   } }],
 });
-const { PackWriter } = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].contents).toString("base64")}`);
+const { getFragment, PackWriter } = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].contents).toString("base64")}`);
 const { packOptions } = await import(`data:text/javascript;base64,${Buffer.from((await build({ entryPoints: ["src/pack-options.ts"], bundle: true, write: false, format: "esm", platform: "node" })).outputFiles[0].contents).toString("base64")}`);
 const { packedStream } = await import(`data:text/javascript;base64,${Buffer.from((await build({ entryPoints: ["src/stream.ts"], bundle: true, write: false, format: "esm", platform: "node" })).outputFiles[0].contents).toString("base64")}`);
 const defaults = { PACK_MAX_BYTES: "104857600", PACK_LINGER_MS: "1000", PACK_CONCURRENCY: "50", PACK_MAX_PENDING: "1000" };
@@ -36,6 +36,15 @@ const until = async condition => {
   for (let i = 0; i < 100 && !condition(); i++) await delay(5);
   assert.ok(condition(), "operation did not progress");
 };
+
+// An indexed but missing pack is data loss, not a successful or absent fragment.
+const missingScope = { id: "test", store: { describeFragments: async () => [{ state: 0, location: { key: "packs/test/missing", offset: 4, length: 3, flags: 0, content: "3" } }] } };
+const missingBucket = { get: async (key, options) => {
+  assert.equal(key, "packs/test/missing");
+  assert.deepEqual(options, { range: { offset: 4, length: 3 } });
+  return null;
+} };
+await assert.rejects(getFragment({ FRAGMENTS: missingBucket }, missingScope, address), error => error.code === 15 && /fragment association has no payload/.test(error.message));
 
 // No index publication or acknowledgement before R2 finishes.
 let published = 0;

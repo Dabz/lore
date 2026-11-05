@@ -219,7 +219,10 @@ export async function getFragment(env: Env, scope: Scope, address: FragmentAddre
   }
   if (metadataOnly) return { fragment: item.fragment, payload: new Uint8Array() };
   const object = await env.FRAGMENTS.get(item.location.key, { range: { offset: item.location.offset, length: item.location.length } });
-  if (!object) throw new ConnectError("fragment association has no payload", Code.DataLoss);
+  if (!object) {
+    console.error(JSON.stringify({ message: "indexed fragment pack missing", partition: scope.id, key: item.location.key, offset: item.location.offset, length: item.location.length }));
+    throw new ConnectError("fragment association has no payload", Code.DataLoss);
+  }
   const payload = new Uint8Array(await object.arrayBuffer());
   if (payload.length !== item.location.length) throw new ConnectError("truncated fragment pack", Code.DataLoss);
   return { fragment: item.fragment, payload };

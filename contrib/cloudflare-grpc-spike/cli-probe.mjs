@@ -13,7 +13,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import { randomBytes, randomUUID } from "node:crypto";
 
 const target = process.argv[2] ? new URL(process.argv[2]) : null;
-if (target && (target.protocol !== "https:" || target.pathname !== "/" || target.search || target.hash)) throw new Error("usage: node cli-probe.mjs [https://HOST]");
+const cloneOnly = process.argv[3];
+if ((target && (target.protocol !== "https:" || target.pathname !== "/" || target.search || target.hash)) || (cloneOnly && !target) || process.argv.length > 4) throw new Error("usage: node cli-probe.mjs [https://HOST [REPOSITORY_TO_CLONE]]");
 const temp = await mkdtemp(join(tmpdir(), "lore-cli-worker-"));
 const work = join(temp, "work");
 await mkdir(work);
@@ -68,9 +69,9 @@ else bridge.on("stream", (client, headers) => {
 });
 const binary = resolve("../../target/debug/lore");
 const token = [Buffer.from('{"alg":"none"}').toString("base64url"), Buffer.from('{"sub":"tester","iss":"local","aud":"local","exp":4102444800}').toString("base64url"), "x"].join(".");
-async function lore(args, cwd = work) {
+async function lore(args, cwd = work, globalPath = join(temp, "writer-global")) {
   console.log(`\n$ lore ${args.join(" ")}`);
-  const child = spawn(binary, ["--identity", "tester", ...args], { cwd, stdio: "inherit", env: { ...process.env, LORE_ACCESS_TOKEN: token } });
+  const child = spawn(binary, ["--identity", "tester", ...args], { cwd, stdio: "inherit", env: { ...process.env, LORE_ACCESS_TOKEN: token, LORE_GLOBAL_PATH: globalPath } });
   const code = await new Promise((resolve, reject) => { child.on("error", reject); child.on("exit", resolve); });
   if (code !== 0) throw new Error(`lore exited with status ${code}`);
 }
@@ -81,24 +82,31 @@ try {
   }
   await new Promise(resolve => bridge.listen(0, "127.0.0.1", resolve));
   const url = `grpc://127.0.0.1:${bridge.address().port}`;
-  const name = target ? `probe-${randomUUID()}` : "demo";
-  await lore(["repository", "create", `${url}/${name}`]);
-  await lore(["repository", "list", url]);
-  await writeFile(join(work, "example.txt"), "Hello from Lore on Workers.\n");
-  const large = randomBytes(8 * 1024 * 1024);
-  await writeFile(join(work, "large.bin"), large);
-  await lore(["stage", "example.txt"]);
-  await lore(["stage", "large.bin"]);
-  await lore(["commit", "initial commit"]);
-  await lore(["push"]);
-  await writeFile(join(work, "example.txt"), "A second revision on Workers.\n");
-  await lore(["stage", "example.txt"]);
-  await lore(["commit", "second commit"]);
-  await lore(["push"]);
-  await lore(["clone", `${url}/${name}`, join(temp, "clone")], temp);
-  assert.equal(await readFile(join(temp, "clone", "example.txt"), "utf8"), "A second revision on Workers.\n");
-  assert.deepEqual(await readFile(join(temp, "clone", "large.bin")), large);
-  console.log("CLI create, list, stage, commit, push and clone (including 8 MiB fragmented file) passed");
+  if (cloneOnly) {
+    await lore(["clone", `${url}/${cloneOnly}`, join(temp, "clone")], temp, join(temp, "clone-global"));
+    console.log("Clean-data clone passed");
+  } else {
+    const name = target ? `probe-${randomUUID()}` : "demo";
+    await lore(["repository", "create", `${url}/${name}`]);
+    await lore(["repository", "list", url]);
+    await writeFile(join(work, "example.txt"), "Hello from Lore on Workers.\n");
+    const large = randomBytes(8 * 1024 * 1024);
+    await writeFile(join(work, "large.bin"), large);
+    await lore(["stage", "example.txt"]);
+    await lore(["stage", "large.bin"]);
+    await lore(["commit", "initial commit"]);
+    await lore(["push"]);
+    await writeFile(join(work, "example.txt"), "A second revision on Workers.\n");
+    await lore(["stage", "example.txt"]);
+    await lore(["commit", "second commit"]);
+    await lore(["push"]);
+    // A separate global directory prevents a shared client store from masking
+    // missing remote fragments during the clone.
+    await lore(["clone", `${url}/${name}`, join(temp, "clone")], temp, join(temp, "clone-global"));
+    assert.equal(await readFile(join(temp, "clone", "example.txt"), "utf8"), "A second revision on Workers.\n");
+    assert.deepEqual(await readFile(join(temp, "clone", "large.bin")), large);
+    console.log("CLI create, list, stage, commit, push and clone (including 8 MiB fragmented file) passed");
+  }
 } finally {
   bridge.close();
   if (remote) remote.destroy();

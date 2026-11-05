@@ -112,10 +112,15 @@ node pack-failure-probe.mjs
 node immutable-probe.mjs
 node cli-probe.mjs
 node cli-probe.mjs https://lore-mvp.gasparina.work
+node cli-probe.mjs https://lore-mvp.gasparina.work EXISTING-REPOSITORY
 ```
 
 The remote CLI probe exercises the code currently deployed at the target URL;
-run it against the packed version only after that version is deployed.
+run it against the packed version only after that version is deployed. It uses
+separate temporary Lore global data directories for the writer and clone, so
+the clone cannot reuse the writer's shared store. The optional repository name
+runs a clean-data clone of an existing repository instead of creating one; the
+temporary clone and its downloaded files are removed when the probe exits.
 
 `npm run generate` creates protobuf JavaScript and TypeScript declarations;
 `npm run typecheck` regenerates Cloudflare runtime and binding types from the
