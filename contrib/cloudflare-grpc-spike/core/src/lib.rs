@@ -3,6 +3,10 @@
 //! Narrow synchronous ABI between the Worker adapter and Lore's portable code.
 //! The synchronous adapter owns allocations and metadata handles until freed.
 
+mod revision_abi;
+mod revision_format;
+mod revision_node;
+
 use bytes::BytesMut;
 use lore_base::types::{
     Fragment, Hash, fragment_metadata_is_valid, validate_fragment_reference_list,

@@ -132,15 +132,17 @@ not mean 50 simultaneous R2 connections. Measure throughput and memory on the
 target account before tuning these values.
 
 Fragmented content of at least 4 MiB is also repacked in logical content order
-when published through `PutResolved` or verified during a branch push. This
+after publication through `PutResolved` or a successful branch push. This
 walks the tree, assembles up to 8 MiB per output object, and conditionally moves
 each index entry only if its old location is still current. The original packs
 are retained, so reads that already resolved an old location can finish. Repack
 errors are logged and do not prevent publication; completed pack relocations are
-not rolled back. Repacking runs on the publication path and can add substantial
-latency. Its 100,000-reference and depth limits, partial failure behavior, and
-additional R2 storage make this an experimental optimization, not garbage
-collection or a production compactor.
+not rolled back. Repacking runs as best-effort `waitUntil` work, one tree at a
+time per request. Cloudflare cancels unfinished background work 30 seconds after
+the response finishes or the client disconnects, so large repacks may be partial.
+Its 100,000-reference and depth limits, partial failure behavior, and additional
+R2 storage make this an experimental optimization, not garbage collection or a
+production compactor.
 
 ### Read settings
 
@@ -217,15 +219,15 @@ CLI probe, build `target/debug/lore` with `cargo build --locked -p lore-client
 npm ci
 npm run generate
 npm run typecheck
-node mutable-probe.mjs
-node core-probe.mjs
-node pack-failure-probe.mjs
-node read-probe.mjs
-node repack-probe.mjs
-node immutable-probe.mjs
-node cli-probe.mjs
-node cli-probe.mjs https://lore-mvp.gasparina.work
-node cli-probe.mjs https://lore-mvp.gasparina.work EXISTING-REPOSITORY
+node scripts/mutable-probe.mjs
+node scripts/core-probe.mjs
+node scripts/pack-failure-probe.mjs
+node scripts/read-probe.mjs
+node scripts/repack-probe.mjs
+node scripts/immutable-probe.mjs
+node scripts/cli-probe.mjs
+node scripts/cli-probe.mjs https://lore-mvp.gasparina.work
+node scripts/cli-probe.mjs https://lore-mvp.gasparina.work EXISTING-REPOSITORY
 ```
 
 The remote CLI probe exercises the code currently deployed at the target URL;
@@ -259,10 +261,12 @@ compiler (for example, `export RUSTC="$(rustup which rustc)"`).
 
 ## Scope and limitations
 
-Fragment ingress checks, content hashing and metadata buffer encoding and
-validation use the same portable Rust code as native Lore through Wasm. The
-Fetch/Connect, R2 and Durable Object adapters, Zstd decoding, revision graph
-traversal and branch operations are TypeScript; this is not a complete
+Fragment ingress checks, content hashing and metadata buffer validation and
+encoding reuse portable Lore Rust through Wasm. Revision header and node-block
+decoding, metadata-address extraction and fragment-tree coverage checks also
+run in the spike's Rust core; their layouts mirror the native revision formats.
+The Fetch/Connect, R2 and Durable Object adapters, Zstd decoding, asynchronous
+revision fetching and branch operations are TypeScript; this is not a complete
 port of the Lore server or its revision semantics.
 
 Implemented: discovery; repository create/get/list and metadata get; default

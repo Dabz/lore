@@ -178,7 +178,15 @@ export class PackedMutablePartition extends DurableObject<Env> {
 }
 
 export default {
-  async fetch(request: Request, env: Env) {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    // Repack one tree at a time to bound background memory per request.
+    let repackPending = Promise.resolve();
+    function scheduleRepack(scope: Scope, root: FragmentAddress) {
+      repackPending = repackPending.then(() => repackTree(env, scope, root)).catch(error => {
+        console.error({ event: "repack_failed", partition: scope.id, root: toHex(root.hash), error: String(error) });
+      });
+      ctx.waitUntil(repackPending);
+    }
     const router = createConnectRouter();
     router.service(EnvironmentService, { environmentGet: () => ({ environment: { config: { compressionMode: 1, maxQueryBatch: 5461 } } }) });
     router.service(RepositoryService, repositoryService(env));
@@ -214,6 +222,7 @@ export default {
         const result = await scope.store.advanceBranch(branchId, verified.parent, hex(req.revisionSignature), String(verified.number));
         if (result.result === "missing") throw new ConnectError("branch not found", Code.NotFound);
         if (result.result !== "ok") throw new ConnectError(`branch push is not a fast-forward; branch latest: ${result.latest}`, Code.FailedPrecondition);
+        for (const root of verified.repack) scheduleRepack(scope, root);
         return { revisionSignature: req.revisionSignature, revisionNumber: verified.number, fastForwardMerged: false };
       },
     });
@@ -278,11 +287,10 @@ export default {
             const update = previous.catch(() => {}).then(async () => {
               const error: unknown = await written;
               if (error !== null) throw error;
-              if (target !== ZERO && req.fragment && (req.fragment.flags & 1) && req.fragment.sizeContent >= 4n * 1024n * 1024n) {
-                try { await repackTree(env, scope, req.address!); }
-                catch (error) { console.error({ event: "repack_failed", partition: scope.id, error: String(error) }); }
-              }
               await scope.store.store(7, key, target);
+              if (target !== ZERO && req.fragment && (req.fragment.flags & 1) && req.fragment.sizeContent >= 4n * 1024n * 1024n) {
+                scheduleRepack(scope, req.address!);
+              }
             });
             chains.set(key, update);
             try { await update; } finally { if (chains.get(key) === update) chains.delete(key); }
